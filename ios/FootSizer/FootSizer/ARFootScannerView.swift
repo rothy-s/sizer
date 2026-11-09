@@ -389,21 +389,24 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 
         // Show ONLY the locked-on foot cluster (green) — visual confirmation of the lock.
         showFootPointCloud(points: result.isolatedPoints, cameraTransform: frame.camera.transform)
-        recordScanAndReset(frame: frame, seed: seed, result: result, rejectReason: nil)
         let m = result.measurement
         if result.heelHidden {
-            statusLabel.textColor = .systemYellow
-            statusLabel.text = String(
-                format: "Width %.0f mm ✓  Heel hidden behind your leg — length (%.0f mm) is toe to ankle only and too short.",
-                m.ballWidthMm, m.lengthMm
-            )
-        } else {
-            statusLabel.textColor = .white
-            statusLabel.text = String(
-                format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
-                m.lengthMm, m.ballWidthMm, m.archHeightMm, result.isolatedPoints.count
-            )
+            // The length would be a guess (and short). Keep the scanner open for another sweep
+            // rather than hand a wrong length to the results.
+            recordScanAndReset(frame: frame, seed: seed, result: result, rejectReason: "heel_not_seen")
+            restoreDebugMeshes()
+            showProblem(String(
+                format: "Heel not seen (width %.0f mm looks fine). Scan again and bring the phone low and right round behind the heel.",
+                m.ballWidthMm
+            ))
+            return
         }
+        recordScanAndReset(frame: frame, seed: seed, result: result, rejectReason: nil)
+        statusLabel.textColor = .white
+        statusLabel.text = String(
+            format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
+            m.lengthMm, m.ballWidthMm, m.archHeightMm, result.isolatedPoints.count
+        )
         onCaptured?(m)
     }
 

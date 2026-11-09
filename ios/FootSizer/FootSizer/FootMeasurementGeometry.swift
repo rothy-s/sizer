@@ -27,6 +27,8 @@ enum FootMeasurementGeometry {
     static let floorBandMm: Double = 10.0
     static let legCapMm: Double = 95.0
     static let legShadowCapMm: Double = 60.0
+    /// Leg points this far above `legCapMm` mark where the ankle stands.
+    static let ankleSliceMm: Double = 35.0
     static let maxFloorSlope: Double = 0.12
     static let gridCellM: Double = 0.01
     static let tipCorrectionMm: Double = 26.0
@@ -36,8 +38,9 @@ enum FootMeasurementGeometry {
         let measurement: FootSideMeasurement
         /// The isolated foot cluster (world/reference space) — used to draw the lock-on cloud.
         let isolatedPoints: [SIMD3<Float>]
-        /// True when the leg sits at the end of the visible foot: the heel was not seen and
-        /// `lengthMm` only covers toe → front of the ankle (too short). Width is unaffected.
+        /// True when the heel end of the length comes from the ankle's footprint rather than
+        /// from heel points the camera actually saw — the length is then unreliable (short).
+        /// Width is unaffected.
         let heelHidden: Bool
     }
 
@@ -97,25 +100,49 @@ enum FootMeasurementGeometry {
         }
         guard above.count >= minPointCount else { return nil }
 
-        // Isolate the foot cluster the user aimed at (seed) or the dominant one.
-        var band = isolateOpened(above, a0: a0, a1: a1, seed: seed)
+        // Isolate the foot cluster the user aimed at (seed) or the dominant one. The ankle
+        // stands on the heel, so its footprint bridges the forefoot to heel points behind the leg.
+        var ankle = Set<Cell>()
+        for (p, h) in zip(points, heights) where h > legCapMm && h <= legCapMm + ankleSliceMm {
+            ankle.insert(cellKey(p, a0, a1, gridCellM))
+        }
+        var (band, ankleKept) = isolateOpened(above, a0: a0, a1: a1, seed: seed, bridge: ankle)
         if band.count < minPointCount {
             band = isolate(above, a0: a0, a1: a1, cell: 0.02, seed: seed)
+            ankleKept = []
         }
         let n = band.count
         guard n >= minPointCount else { return nil }
 
+        // Ankle cells stand in for the heel under them: each counts as an average cell's worth
+        // of points at its centre (integer weight, so Swift and Python agree exactly).
+        let virt: [(Double, Double)] = ankleKept
+            .sorted { $0.x != $1.x ? $0.x < $1.x : $0.y < $1.y }
+            .map { ((Double($0.x) + 0.5) * gridCellM, (Double($0.y) + 0.5) * gridCellM) }
+        let bandCellCount = Set(band.map { cellKey($0, a0, a1, gridCellM) }).count
+        let wvInt = max(1, n / max(1, bandCellCount))
+        let wv = Double(wvInt)
+        let total = Double(n + wvInt * virt.count)
+
         // PCA in the horizontal plane.
-        var ma: Double = 0, mb: Double = 0
-        for p in band { ma += Double(p[a0]); mb += Double(p[a1]) }
-        ma /= Double(n); mb /= Double(n)
+        var sa: Double = 0, sb: Double = 0
+        for p in band { sa += Double(p[a0]); sb += Double(p[a1]) }
+        var va: Double = 0, vb: Double = 0
+        for v in virt { va += v.0; vb += v.1 }
+        let ma = (sa + wv * va) / total
+        let mb = (sb + wv * vb) / total
         var saa: Double = 0, sab: Double = 0, sbb: Double = 0
         for p in band {
             let da = Double(p[a0]) - ma
             let db = Double(p[a1]) - mb
             saa += da * da; sab += da * db; sbb += db * db
         }
-        saa /= Double(n); sab /= Double(n); sbb /= Double(n)
+        for v in virt {
+            let da = v.0 - ma
+            let db = v.1 - mb
+            saa += wv * da * da; sab += wv * da * db; sbb += wv * db * db
+        }
+        saa /= total; sab /= total; sbb /= total
         let tr = saa + sbb
         let det = saa * sbb - sab * sab
         let disc = max(0.0, tr * tr / 4 - det)
@@ -140,32 +167,20 @@ enum FootMeasurementGeometry {
             proj.append((da * ux + db * uy, da * vx + db * vy, height(p)))
         }
 
-        let ts = proj.map { $0.t }.sorted()
+        let realTs = proj.map { $0.t }.sorted()
+        var allTs = realTs
+        for v in virt {
+            let t = (v.0 - ma) * ux + (v.1 - mb) * uy
+            for _ in 0..<wvInt { allTs.append(t) }
+        }
+        let ts = allTs.sorted()
         let tmin = percentile(ts, 0.005)
         let tmax = percentile(ts, 0.995)
         let span = (tmax - tmin) == 0 ? 1.0 : (tmax - tmin)
         let lengthMm = span * 1000.0 + tipCorrectionMm
-
-        // Heel hidden? When the leg block attached to the cluster is centred at (or beyond)
-        // an end of the visible extent, the camera saw toe → ankle only.
-        var heelHidden = false
-        let bandCells = Set(band.map { cellKey($0, a0, a1, gridCellM) })
-        var block = Set(legCells.filter { k in neighbours(k).contains { bandCells.contains($0) } })
-        var stack = Array(block)
-        while let k = stack.popLast() {
-            for q in neighbours(k) where legCells.contains(q) && !block.contains(q) {
-                block.insert(q)
-                stack.append(q)
-            }
-        }
-        if !block.isEmpty {
-            var lt = 0.0
-            for k in block {
-                lt += ((Double(k.x) + 0.5) * gridCellM - ma) * ux + ((Double(k.y) + 0.5) * gridCellM - mb) * uy
-            }
-            lt /= Double(block.count)
-            heelHidden = lt < tmin + 0.10 * span || lt > tmax - 0.10 * span
-        }
+        // Heel end set by the ankle footprint rather than by points seen on the heel itself?
+        let heelHidden = percentile(realTs, 0.005) - tmin > 0.005
+            || tmax - percentile(realTs, 0.995) > 0.005
 
         func widthIn(_ loFrac: Double, _ hiFrac: Double) -> Double {
             let lo = tmin + loFrac * span
@@ -309,16 +324,18 @@ enum FootMeasurementGeometry {
     /// Structures under ~30 mm wide never form a core, so they drop out. Returns [] when
     /// the cloud is too sparse to have any core cell.
     private static func isolateOpened(
-        _ points: [SIMD3<Float>], a0: Int, a1: Int, seed: SIMD2<Float>?
-    ) -> [SIMD3<Float>] {
+        _ points: [SIMD3<Float>], a0: Int, a1: Int, seed: SIMD2<Float>?, bridge: Set<Cell> = []
+    ) -> (points: [SIMD3<Float>], bridgeKept: Set<Cell>) {
         var cells: [Cell: [Int]] = [:]
         for (i, p) in points.enumerated() {
             cells[cellKey(p, a0, a1, gridCellM), default: []].append(i)
         }
-        let core = Set(cells.keys.filter { k in
-            neighbours(k).reduce(0) { $0 + (cells[$1] != nil ? 1 : 0) } >= 7
-        })
-        if core.isEmpty { return [] }
+        // `bridge` cells count as occupied without holding points.
+        let occupied = Set(cells.keys).union(bridge)
+        let core = occupied.filter { k in
+            neighbours(k).reduce(0) { $0 + (occupied.contains($1) ? 1 : 0) } >= 7
+        }
+        if core.isEmpty { return ([], []) }
 
         func component(from start: Cell) -> Set<Cell> {
             var seen: Set<Cell> = [start]
@@ -333,7 +350,7 @@ enum FootMeasurementGeometry {
         }
         func grown(_ comp: Set<Cell>) -> Set<Cell> {
             var out = Set<Cell>()
-            for k in comp { for q in neighbours(k) where cells[q] != nil { out.insert(q) } }
+            for k in comp { for q in neighbours(k) where occupied.contains(q) { out.insert(q) } }
             return out
         }
         func ordered(_ a: Cell, _ b: Cell) -> Bool { a.x != b.x ? a.x < b.x : a.y < b.y }
@@ -357,7 +374,8 @@ enum FootMeasurementGeometry {
                 if count > best { best = count; keep = g }
             }
         }
-        return keep.sorted(by: ordered).flatMap { cells[$0] ?? [] }.map { points[$0] }
+        let kept = keep.sorted(by: ordered).flatMap { cells[$0] ?? [] }.map { points[$0] }
+        return (kept, keep.filter { cells[$0] == nil })
     }
 
     private static func cellKey(_ p: SIMD3<Float>, _ a0: Int, _ a1: Int, _ cell: Double) -> Cell {

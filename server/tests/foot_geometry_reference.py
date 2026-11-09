@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 FLOOR_BAND_MM = 10.0        # cut this far above the floor plane (clears noisy floor slab)
 LEG_CAP_MM = 95.0           # ignore points taller than this (attached ankle/shin)
 LEG_SHADOW_CAP_MM = 60.0    # height cap inside a leg column (cell with points above LEG_CAP_MM)
+ANKLE_SLICE_MM = 35.0       # leg points this far above LEG_CAP_MM mark where the ankle stands
 MAX_FLOOR_SLOPE = 0.12      # ignore a fitted floor steeper than this (m/m): not a floor
 GRID_CELL_M = 0.01          # isolation grid
 TIP_CORRECTION_MM = 26.0    # add back the toe+heel taper lost at the floor-band cut
@@ -61,9 +62,10 @@ class FootStages:
     # Fitted floor: vertical = a*p[a0] + b*p[a1] + c. Use `height_mm` for heights.
     floor_plane: tuple | None = None
     leg_cells: set = field(default_factory=set)     # 10 mm cells holding points above the leg cap
-    # True when the leg sits at the end of the visible foot, i.e. the heel was not seen
-    # and `length_mm` only covers toe -> front of the ankle.
+    # True when the heel end of the length comes from the ankle's footprint rather than
+    # from heel points the camera actually saw (the heel sits under the ankle).
     heel_hidden: bool = False
+    ankle_cells: set = field(default_factory=set)   # ankle-slice cells joined to the cluster
     above: list = field(default_factory=list)   # points kept by the floor/leg height band
     band: list = field(default_factory=list)    # the isolated foot cluster
     centroid: tuple | None = None           # (a0, a1) mean of the cluster
@@ -206,20 +208,24 @@ def _neighbours(k):
     return [(k[0] + dx, k[1] + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
 
 
-def _isolate_opened(points, a0, a1, seed):
+def _isolate_opened(points, a0, a1, seed, bridge=frozenset()):
     """Foot cluster via morphological opening on the 10 mm grid.
 
     A cell is *core* when at least 7 of its 3x3 block are occupied; cores form connected
     components; the chosen component (nearest the seed, else the most points) is grown
     back by one cell. Structures under ~30 mm wide never form a core, so they drop out.
-    Returns [] when the cloud is too sparse to have any core cell.
+    `bridge` cells count as occupied without holding points: the ankle stands on the heel,
+    so its footprint joins the forefoot to whatever heel points lie behind the leg.
+    Returns (points, bridge cells kept); ([], set()) when the cloud is too sparse to have
+    any core cell.
     """
     cells: dict = {}
     for i, p in enumerate(points):
         cells.setdefault(_cell(p, a0, a1), []).append(i)
-    core = {k for k in cells if sum(1 for q in _neighbours(k) if q in cells) >= 7}
+    occupied = set(cells) | set(bridge)
+    core = {k for k in occupied if sum(1 for q in _neighbours(k) if q in occupied) >= 7}
     if not core:
-        return []
+        return [], set()
 
     def component(start):
         seen = {start}
@@ -233,7 +239,7 @@ def _isolate_opened(points, a0, a1, seed):
         return seen
 
     def grown(comp):
-        return {q for k in comp for q in _neighbours(k) if q in cells}
+        return {q for k in comp for q in _neighbours(k) if q in occupied}
 
     if seed is not None:
         sk = (int(math.floor(seed[0] / GRID_CELL_M)), int(math.floor(seed[1] / GRID_CELL_M)))
@@ -250,10 +256,11 @@ def _isolate_opened(points, a0, a1, seed):
             comp = component(start)
             seen |= comp
             g = grown(comp)
-            count = sum(len(cells[k]) for k in g)
+            count = sum(len(cells.get(k, ())) for k in g)
             if count > best:
                 best, keep = count, g
-    return [points[i] for k in sorted(keep) for i in cells[k]]
+    kept_points = [points[i] for k in sorted(keep) if k in cells for i in cells[k]]
+    return kept_points, {k for k in keep if k not in cells}
 
 
 def fuse_frames(points, frame_index, voxel_m: float = FUSE_VOXEL_M,
@@ -355,18 +362,27 @@ def measure_foot_stages(points, up: int = 1, seed=None,
         st.reject_reason = "too_few_above_floor"
         return st
 
-    band = _isolate_opened(above, a0, a1, seed)
+    ankle = {_cell(p, a0, a1) for p, h in zip(points, heights)
+             if leg_cap_mm < h <= leg_cap_mm + ANKLE_SLICE_MM}
+    band, ankle_kept = _isolate_opened(above, a0, a1, seed, bridge=ankle)
     if len(band) < min_points:
-        band = _isolate(above, a0, a1, 0.02, seed)
+        band, ankle_kept = _isolate(above, a0, a1, 0.02, seed), set()
     st.band = band
+    st.ankle_cells = ankle_kept
     n = len(band)
     if n < min_points:
         st.reject_reason = "cluster_too_small"
         return st
 
+    # Ankle cells stand in for the heel under them: each counts as an average cell's worth
+    # of points at its centre (integer weight, so Swift and Python agree exactly).
+    virt = [((k[0] + 0.5) * GRID_CELL_M, (k[1] + 0.5) * GRID_CELL_M) for k in sorted(ankle_kept)]
+    wv = max(1, n // max(1, len({_cell(p, a0, a1) for p in band})))
+    total = n + wv * len(virt)
+
     # PCA in the horizontal plane.
-    ma = sum(p[a0] for p in band) / n
-    mb = sum(p[a1] for p in band) / n
+    ma = (sum(p[a0] for p in band) + wv * sum(v[0] for v in virt)) / total
+    mb = (sum(p[a1] for p in band) + wv * sum(v[1] for v in virt)) / total
     saa = sab = sbb = 0.0
     for p in band:
         da = p[a0] - ma
@@ -374,9 +390,15 @@ def measure_foot_stages(points, up: int = 1, seed=None,
         saa += da * da
         sab += da * db
         sbb += db * db
-    saa /= n
-    sab /= n
-    sbb /= n
+    for v in virt:
+        da = v[0] - ma
+        db = v[1] - mb
+        saa += wv * da * da
+        sab += wv * da * db
+        sbb += wv * db * db
+    saa /= total
+    sab /= total
+    sbb /= total
     tr = saa + sbb
     det = saa * sbb - sab * sab
     disc = max(0.0, tr * tr / 4 - det)
@@ -397,28 +419,17 @@ def measure_foot_stages(points, up: int = 1, seed=None,
         db = p[a1] - mb
         proj.append((da * ux + db * uy, da * vx + db * vy, height(p)))
 
-    ts = sorted(t for t, _, _ in proj)
+    real_ts = sorted(t for t, _, _ in proj)
+    virt_ts = [(v[0] - ma) * ux + (v[1] - mb) * uy for v in virt]
+    ts = sorted(real_ts + [t for t in virt_ts for _ in range(wv)])
     tmin = _percentile(ts, 0.005)
     tmax = _percentile(ts, 0.995)
     span = tmax - tmin or 1.0
     length_mm = span * 1000.0 + tip_correction_mm
     st.tmin, st.tmax = tmin, tmax
-
-    # Heel hidden? When the leg block attached to the cluster is centred at (or beyond)
-    # an end of the visible extent, the camera saw toe -> ankle only.
-    band_cells = {_cell(p, a0, a1) for p in band}
-    block = {k for k in leg_cells if any(q in band_cells for q in _neighbours(k))}
-    stack = list(block)
-    while stack:
-        k = stack.pop()
-        for q in _neighbours(k):
-            if q in leg_cells and q not in block:
-                block.add(q)
-                stack.append(q)
-    if block:
-        lt = sum(((k[0] + 0.5) * GRID_CELL_M - ma) * ux + ((k[1] + 0.5) * GRID_CELL_M - mb) * uy
-                 for k in block) / len(block)
-        st.heel_hidden = lt < tmin + 0.10 * span or lt > tmax - 0.10 * span
+    # Heel end set by the ankle footprint rather than by points seen on the heel itself?
+    st.heel_hidden = (_percentile(real_ts, 0.005) - tmin > 0.005
+                      or tmax - _percentile(real_ts, 0.995) > 0.005)
 
     def width_in(lo_frac, hi_frac):
         lo = tmin + lo_frac * span

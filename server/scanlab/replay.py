@@ -76,8 +76,8 @@ def _checks(bundle: ScanBundle, st: FootStages, floor_band_mm: float) -> list[st
         out.append(f"The locked-on cluster holds only {len(st.band) / len(st.above):.0%} of the "
                    "points above the floor — it may have locked onto the wrong object.")
     if st.heel_hidden:
-        out.append("The heel is hidden behind the leg, so the length only covers toe to ankle "
-                   "and is too short. Width is unaffected.")
+        out.append("The heel was not seen: its end of the length is estimated from the ankle "
+                   "and is unreliable (short). Width is unaffected.")
     if st.length_mm and st.ball_width_mm:
         aspect = st.length_mm / st.ball_width_mm
         if not 2.1 <= aspect <= 3.1:
