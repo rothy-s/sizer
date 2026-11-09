@@ -76,3 +76,33 @@ The pipeline reference spec is `server/tests/foot_geometry_reference.py`; the iO
 - Replace the seed catalog with your production database.
 - Tighten mesh sampling (e.g. floor plane + ROI).
 - Add optional authentication on `POST /v1/measurements`.
+
+## Scan recordings and replay (the feedback loop)
+
+Every capture in the iOS app — accepted **or rejected** — is saved as a bundle under
+`Documents/Scans/<scan id>/`:
+
+| File | Contents |
+|---|---|
+| `meta.json` | scanner, device, tap seed, per-frame poses, algorithm constants, on-device result |
+| `points.f32` | the exact point cloud the engine measured (little-endian float32 x,y,z, meters) |
+| `frame_index.u8` | which fused frame each point came from (255 = scene-mesh vertex) |
+| `photo.jpg` | what the camera saw |
+
+Get bundles off the phone with **Export all scans** on the main screen (AirDrop), the Files
+app (On My iPhone → FootSizer → Scans), or Finder file sharing over USB. Keep real scans in
+`tests/fixtures/scans/`.
+
+Replay them through the Python reference pipeline:
+
+```bash
+cd server && python -m scanlab.replay ../tests/fixtures/scans
+```
+
+That prints one line per scan and writes `scan-reports/index.html` plus a page per scan
+showing each pipeline stage to scale (raw cloud → floor/leg cut → chosen cluster → the
+aligned shape that gets measured → frame fusion). Each page also checks that the Python
+reference reproduces the number the Swift engine reported on-device.
+
+The format is defined in `ios/FootSizer/FootSizer/ScanRecorder.swift` and mirrored by
+`server/scanlab/bundle.py`; both test suites pin the same literal bytes.

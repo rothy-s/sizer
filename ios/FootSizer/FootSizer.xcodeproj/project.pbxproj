@@ -19,6 +19,7 @@
 		A10000000000000000000010 /* FootSizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* FootSizerTests.swift */; };
 		A10000000000000000000011 /* FootDepthSampling.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* FootDepthSampling.swift */; };
 		A10000000000000000000012 /* FootMeasurementGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* FootMeasurementGeometry.swift */; };
+		A10000000000000000000020 /* ScanRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000020 /* ScanRecorder.swift */; };
 		A10000000000000000000014 /* SizeConversion.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* SizeConversion.swift */; };
 		A10000000000000000000015 /* FootResultsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000016 /* FootResultsView.swift */; };
 		A10000000000000000000013 /* TrueDepthFootScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* TrueDepthFootScannerView.swift */; };
@@ -38,6 +39,7 @@
 		B10000000000000000000011 /* FootSizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootSizerTests.swift; sourceTree = "<group>"; };
 		B10000000000000000000012 /* FootDepthSampling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootDepthSampling.swift; sourceTree = "<group>"; };
 		B10000000000000000000013 /* FootMeasurementGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootMeasurementGeometry.swift; sourceTree = "<group>"; };
+		B10000000000000000000020 /* ScanRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanRecorder.swift; sourceTree = "<group>"; };
 		B10000000000000000000015 /* SizeConversion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SizeConversion.swift; sourceTree = "<group>"; };
 		B10000000000000000000016 /* FootResultsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootResultsView.swift; sourceTree = "<group>"; };
 		B10000000000000000000014 /* TrueDepthFootScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrueDepthFootScannerView.swift; sourceTree = "<group>"; };
@@ -106,6 +108,7 @@
 				B10000000000000000000006 /* APIClient.swift */,
 				B10000000000000000000012 /* FootDepthSampling.swift */,
 				B10000000000000000000013 /* FootMeasurementGeometry.swift */,
+				B10000000000000000000020 /* ScanRecorder.swift */,
 				B10000000000000000000015 /* SizeConversion.swift */,
 				B10000000000000000000016 /* FootResultsView.swift */,
 				B10000000000000000000014 /* TrueDepthFootScannerView.swift */,
@@ -227,6 +230,7 @@
 				A10000000000000000000006 /* APIClient.swift in Sources */,
 				A10000000000000000000011 /* FootDepthSampling.swift in Sources */,
 				A10000000000000000000012 /* FootMeasurementGeometry.swift in Sources */,
+				A10000000000000000000020 /* ScanRecorder.swift in Sources */,
 				A10000000000000000000014 /* SizeConversion.swift in Sources */,
 				A10000000000000000000015 /* FootResultsView.swift in Sources */,
 				A10000000000000000000013 /* TrueDepthFootScannerView.swift in Sources */,

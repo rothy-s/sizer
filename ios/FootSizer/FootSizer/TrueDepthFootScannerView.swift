@@ -145,12 +145,22 @@ private enum TrueDepthOrientation {
 
 // MARK: - UIKit controller
 
-final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepthDataOutputDelegate {
+final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepthDataOutputDelegate,
+    AVCaptureVideoDataOutputSampleBufferDelegate {
     var onCaptured: ((FootSideMeasurement) -> Void)?
     var onError: ((String) -> Void)?
+    /// "left" / "right" — only used to label the recorded scan bundle.
+    var side: String?
+    /// Called on the main thread after a scan bundle has been written to disk.
+    var onScanRecorded: (() -> Void)?
 
     private let session = AVCaptureSession()
     private let depthOutput = AVCaptureDepthDataOutput()
+    /// Colour frames are kept only so a recorded scan bundle can include a photo.
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let videoQueue = DispatchQueue(label: "footsizer.truedepth.video", qos: .utility)
+    private let latestVideoLock = NSLock()
+    private var latestVideoFrame: CVPixelBuffer?
     private let motionManager = CMMotionManager()
     private var latestMotion: CMDeviceMotion?
 
@@ -162,6 +172,11 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
     private var scanFramesRemaining = 0
     private var scanAccumPoints: [SIMD3<Float>] = []
     private var scanVoxelKeys = Set<String>()
+    /// Parallel to `scanAccumPoints`: which fused frame each point came from (recorded bundles).
+    private var scanAccumFrame: [UInt8] = []
+    private var scanFrames: [ScanBundleMeta.Frame] = []
+    private let scanFrameCount = 12
+    private let scanRadiusMeters: Float = 0.22
     private let maxScanPoints = 40_000
     private var needsCenterPixel = true
     private var centerPixel: (Int, Int)?
@@ -170,14 +185,78 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
         "\(Int(p.x * 250))_\(Int(p.y * 250))_\(Int(p.z * 250))"
     }
 
-    private func appendScanPoints(_ pts: [SIMD3<Float>]) {
+    /// Adds voxel-deduplicated points tagged with their source frame; returns how many were new.
+    @discardableResult
+    private func appendScanPoints(_ pts: [SIMD3<Float>], frameIndex: UInt8) -> Int {
+        var added = 0
         for p in pts {
             let k = quantKey(p)
             if scanVoxelKeys.insert(k).inserted {
                 scanAccumPoints.append(p)
-                if scanAccumPoints.count >= maxScanPoints { return }
+                scanAccumFrame.append(frameIndex)
+                added += 1
+                if scanAccumPoints.count >= maxScanPoints { break }
             }
         }
+        return added
+    }
+
+    private func resetScanAccumulation() {
+        scanAccumPoints.removeAll(keepingCapacity: false)
+        scanAccumFrame.removeAll(keepingCapacity: false)
+        scanVoxelKeys.removeAll(keepingCapacity: false)
+        scanFrames.removeAll(keepingCapacity: false)
+    }
+
+    /// Saves the fused cloud exactly as the engine saw it (accepted or rejected) so the
+    /// capture can be replayed offline, then clears the accumulation buffers.
+    private func recordScanAndReset(measurement: FootSideMeasurement?, rejectReason: String?) {
+        latestVideoLock.lock()
+        let videoFrame = latestVideoFrame
+        latestVideoLock.unlock()
+        let photo = videoFrame.flatMap { ScanRecorder.jpegData(from: $0, orientation: .up) }
+
+        let meta = ScanBundleMeta(
+            id: ScanRecorder.newScanID(),
+            createdAt: ScanRecorder.timestamp(),
+            capturePath: "truedepth",
+            side: side,
+            deviceModel: ScanRecorder.deviceModel(),
+            osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            appVersion: ScanRecorder.appVersion(),
+            algorithm: .current,
+            verticalAxis: 2,
+            seed: nil,
+            tapCenter: nil,
+            cropRadiusM: scanRadiusMeters,
+            framesFused: scanFrames.count,
+            pointCount: scanAccumPoints.count,
+            frames: scanFrames,
+            outcome: measurement == nil ? "rejected" : "measured",
+            rejectReason: rejectReason,
+            measurement: measurement,
+            isolatedPointCount: nil,
+            hasPhoto: photo != nil
+        )
+        ScanRecorder.saveInBackground(
+            meta: meta,
+            points: scanAccumPoints,
+            frameIndex: scanAccumFrame,
+            photoJPEG: photo,
+            completion: onScanRecorded
+        )
+        resetScanAccumulation()
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        latestVideoLock.lock()
+        latestVideoFrame = pixelBuffer
+        latestVideoLock.unlock()
     }
 
     override func viewDidLoad() {
@@ -280,6 +359,16 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
             connection.videoOrientation = .portrait
         }
 
+        // Optional colour stream for the recorded-scan photo; the scan works without it.
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
+            if let connection = videoOutput.connection(with: .video), connection.isVideoOrientationSupported {
+                connection.videoOrientation = .portrait
+            }
+        }
+
         let preview = AVCaptureVideoPreviewLayer(session: session)
         preview.videoGravity = .resizeAspectFill
         if let conn = preview.connection {
@@ -301,11 +390,10 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
             statusLabel.text = "Tap on the foot in the preview first."
             return
         }
-        scanAccumPoints.removeAll(keepingCapacity: false)
-        scanVoxelKeys.removeAll(keepingCapacity: false)
+        resetScanAccumulation()
         needsCenterPixel = true
         centerPixel = nil
-        scanFramesRemaining = 12
+        scanFramesRemaining = scanFrameCount
         captureButton.isEnabled = false
         statusLabel.text = "Hold still — fusing TrueDepth depth (12 frames)…"
     }
@@ -321,6 +409,8 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
         guard let tap = lastTapScreenPoint else { return }
 
         let deviceToReference: simd_quatf
+        // Recorded per frame; nil means CoreMotion had no attitude and identity was used.
+        let recordedAttitude: [Float]?
         if let q = latestMotion?.attitude.quaternion {
             deviceToReference = simd_quatf(
                 ix: Float(q.x),
@@ -328,8 +418,10 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
                 iz: Float(q.z),
                 r: Float(q.w)
             )
+            recordedAttitude = [Float(q.x), Float(q.y), Float(q.z), Float(q.w)]
         } else {
             deviceToReference = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            recordedAttitude = nil
         }
 
         let layerPoint = previewLayer.convert(tap, from: view.layer)
@@ -357,11 +449,18 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
             radiusPixels: min(w, h) / 4,
             pixelStride: 2,
             maxPoints: 6000,
-            radiusMeters: 0.22
+            radiusMeters: scanRadiusMeters
         )
 
         let refPts = TrueDepthOrientation.referencePoints(cameraPoints: camPts, deviceToReference: deviceToReference)
-        appendScanPoints(refPts)
+        let frameIndex = scanFrameCount - scanFramesRemaining
+        let added = appendScanPoints(refPts, frameIndex: UInt8(frameIndex))
+        scanFrames.append(ScanBundleMeta.Frame(
+            index: frameIndex,
+            pointCount: added,
+            cameraTransform: nil,
+            attitudeQuat: recordedAttitude
+        ))
 
         scanFramesRemaining -= 1
         if scanFramesRemaining == 0 {
@@ -378,13 +477,11 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
     private func finishScanSuccess() {
         captureButton.isEnabled = true
         guard let m = FootMeasurementGeometry.mondoBallFromReferenceHorizontalXY(scanAccumPoints) else {
-            scanAccumPoints.removeAll(keepingCapacity: false)
-            scanVoxelKeys.removeAll(keepingCapacity: false)
+            recordScanAndReset(measurement: nil, rejectReason: "no_lock_on")
             onError?("Couldn't lock onto a single foot. Improve light, put the foot flat, fill the frame with one foot, and try again.")
             return
         }
-        scanAccumPoints.removeAll(keepingCapacity: false)
-        scanVoxelKeys.removeAll(keepingCapacity: false)
+        recordScanAndReset(measurement: m, rejectReason: nil)
         statusLabel.text = String(format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm", m.lengthMm, m.ballWidthMm, m.archHeightMm)
         onCaptured?(m)
     }
@@ -393,12 +490,16 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
 // MARK: - SwiftUI
 
 struct TrueDepthFootScannerSheet: UIViewControllerRepresentable {
+    var side: String? = nil
     var onCaptured: (FootSideMeasurement) -> Void
     var onError: (String) -> Void
     var onDismiss: () -> Void
+    var onScanRecorded: () -> Void = {}
 
     func makeUIViewController(context: Context) -> TrueDepthFootScannerViewController {
         let c = TrueDepthFootScannerViewController()
+        c.side = side
+        c.onScanRecorded = onScanRecorded
         c.onCaptured = { m in
             onCaptured(m)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {

@@ -18,7 +18,7 @@ Pipeline (gravity-aligned input; `up` selects the vertical axis):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Tuned + validated against a parametric foot model (known ground truth) across sizes
 # 235-320 mm and yaw 0-120 deg: width within 3 mm 98% of the time, length within 6 mm 85%.
@@ -34,6 +34,31 @@ class FootMeasurement:
     ball_width_mm: float
     instep_mm: float
     n_points: int          # points in the isolated foot cluster (lock-on confidence)
+
+
+@dataclass
+class FootStages:
+    """Every intermediate result of the pipeline, for replaying and inspecting a scan.
+
+    `measure_foot` is `measure_foot_stages(...).measurement`; this exists so tooling
+    (`server/scanlab`) can show *where* a capture stopped looking like a foot.
+    """
+    up: int
+    a0: int                                 # horizontal axis indices
+    a1: int
+    n_input: int
+    floor: float | None = None              # vertical coordinate of the floor plane (m)
+    above: list = field(default_factory=list)   # points kept by the floor/leg height band
+    band: list = field(default_factory=list)    # the isolated foot cluster
+    centroid: tuple | None = None           # (a0, a1) mean of the cluster
+    axis: tuple | None = None               # unit long-axis direction in (a0, a1)
+    tmin: float | None = None               # robust extent along the long axis (m)
+    tmax: float | None = None
+    length_mm: float | None = None          # computed even when rejected as implausible
+    ball_width_mm: float | None = None
+    instep_mm: float | None = None
+    measurement: FootMeasurement | None = None
+    reject_reason: str | None = None        # None when a measurement was produced
 
 
 def _percentile(sorted_vals: list[float], q: float) -> float:
@@ -125,23 +150,47 @@ def measure_foot(points, up: int = 1, seed=None,
     (horizontal_a, horizontal_b) tap point used to pick the foot the user aimed at.
     Returns None if no plausible foot cluster is found (drives capture rejection).
     """
-    if len(points) < min_points:
-        return None
+    return measure_foot_stages(
+        points, up=up, seed=seed, floor_band_mm=floor_band_mm, leg_cap_mm=leg_cap_mm,
+        tip_correction_mm=tip_correction_mm, min_points=min_points,
+    ).measurement
+
+
+def measure_foot_stages(points, up: int = 1, seed=None,
+                        floor_band_mm: float = FLOOR_BAND_MM,
+                        leg_cap_mm: float = LEG_CAP_MM,
+                        tip_correction_mm: float = TIP_CORRECTION_MM,
+                        min_points: int = MIN_POINTS) -> FootStages:
+    """Run the pipeline and keep every intermediate stage (see `FootStages`).
+
+    Same arguments as `measure_foot`. On rejection, `reject_reason` says which step
+    gave up and the stages computed up to that point are still populated.
+    """
     ax = [i for i in range(3) if i != up]
     a0, a1 = ax
+    st = FootStages(up=up, a0=a0, a1=a1, n_input=len(points))
+
+    if len(points) < min_points:
+        st.reject_reason = "too_few_points"
+        return st
 
     vert = sorted(p[up] for p in points)
     floor = _floor_level(vert)
+    st.floor = floor
 
     above = [p for p in points
              if floor_band_mm < (p[up] - floor) * 1000.0 <= leg_cap_mm]
+    st.above = above
     if len(above) < min_points:
-        return None
+        st.reject_reason = "too_few_above_floor"
+        return st
 
     band = _isolate(above, a0, a1, 0.02, seed)
+    st.band = band
     n = len(band)
     if n < min_points:
-        return None
+        st.reject_reason = "cluster_too_small"
+        return st
 
     # PCA in the horizontal plane.
     ma = sum(p[a0] for p in band) / n
@@ -167,6 +216,8 @@ def measure_foot(points, up: int = 1, seed=None,
     ulen = math.hypot(ux, uy) or 1.0
     ux, uy = ux / ulen, uy / ulen
     vx, vy = -uy, ux
+    st.centroid = (ma, mb)
+    st.axis = (ux, uy)
 
     proj = []
     for p in band:
@@ -179,6 +230,7 @@ def measure_foot(points, up: int = 1, seed=None,
     tmax = _percentile(ts, 0.995)
     span = tmax - tmin or 1.0
     length_mm = span * 1000.0 + tip_correction_mm
+    st.tmin, st.tmax = tmin, tmax
 
     def width_in(lo_frac, hi_frac):
         lo = tmin + lo_frac * span
@@ -193,12 +245,15 @@ def measure_foot(points, up: int = 1, seed=None,
     mid_hi = tmin + 0.60 * span
     mid_h = sorted(h for t, _, h in proj if mid_lo <= t <= mid_hi)
     instep_mm = _percentile(mid_h, 0.95) if mid_h else 0.0
+    st.length_mm, st.ball_width_mm, st.instep_mm = length_mm, ball_width_mm, instep_mm
 
     if not (120.0 < length_mm < 400.0 and 40.0 < ball_width_mm < 200.0):
-        return None
-    return FootMeasurement(
+        st.reject_reason = "implausible_size"
+        return st
+    st.measurement = FootMeasurement(
         length_mm=length_mm,
         ball_width_mm=ball_width_mm,
         instep_mm=instep_mm,
         n_points=n,
     )
+    return st

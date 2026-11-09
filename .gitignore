@@ -3,3 +3,6 @@ server/footsizer.db
 server/tests/test_api.sqlite
 **/.DS_Store
 **/xcuserdata/
+
+# scanlab replay output
+scan-reports/

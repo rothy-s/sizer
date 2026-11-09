@@ -10,6 +10,10 @@ import simd
 final class FootScanARViewController: UIViewController, ARSessionDelegate {
     var onCaptured: ((FootSideMeasurement) -> Void)?
     var onError: ((String) -> Void)?
+    /// "left" / "right" — only used to label the recorded scan bundle.
+    var side: String?
+    /// Called on the main thread after a scan bundle has been written to disk.
+    var onScanRecorded: (() -> Void)?
 
     private var arView: ARView!
     private var statusLabel: UILabel!
@@ -32,6 +36,11 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     private var scanCenter: SIMD3<Float> = .zero
     private var scanAccumPoints: [SIMD3<Float>] = []
     private var scanVoxelKeys: Set<String> = []
+    /// Parallel to `scanAccumPoints`: which fused frame each point came from (recorded bundles).
+    private var scanAccumFrame: [UInt8] = []
+    private var scanFrames: [ScanBundleMeta.Frame] = []
+    private let scanFrameCount = 10
+    private let scanRadiusMeters: Float = 0.22
     private let maxScanPoints = 40_000
     private var footPointCloudAnchor: AnchorEntity?
 
@@ -193,9 +202,8 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         }
 
         scanCenter = hit
-        scanAccumPoints.removeAll(keepingCapacity: false)
-        scanVoxelKeys.removeAll(keepingCapacity: false)
-        scanFramesRemaining = 10
+        resetScanAccumulation()
+        scanFramesRemaining = scanFrameCount
         lastDepthSampleCount = 0
         captureButton.isEnabled = false
         arView.debugOptions.remove(.showSceneUnderstanding)
@@ -209,14 +217,69 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         "\(Int(p.x * 250))_\(Int(p.y * 250))_\(Int(p.z * 250))"
     }
 
-    private func appendScanPoints(_ pts: [SIMD3<Float>]) {
+    /// Adds voxel-deduplicated points tagged with their source frame; returns how many were new.
+    @discardableResult
+    private func appendScanPoints(_ pts: [SIMD3<Float>], frameIndex: UInt8) -> Int {
+        var added = 0
         for p in pts {
             let k = quantKey(p)
             if scanVoxelKeys.insert(k).inserted {
                 scanAccumPoints.append(p)
-                if scanAccumPoints.count >= maxScanPoints { return }
+                scanAccumFrame.append(frameIndex)
+                added += 1
+                if scanAccumPoints.count >= maxScanPoints { break }
             }
         }
+        return added
+    }
+
+    private func resetScanAccumulation() {
+        scanAccumPoints.removeAll(keepingCapacity: false)
+        scanAccumFrame.removeAll(keepingCapacity: false)
+        scanVoxelKeys.removeAll(keepingCapacity: false)
+        scanFrames.removeAll(keepingCapacity: false)
+    }
+
+    /// Saves the fused cloud exactly as the engine saw it (accepted or rejected) so the
+    /// capture can be replayed offline, then clears the accumulation buffers.
+    private func recordScanAndReset(
+        frame: ARFrame,
+        seed: SIMD2<Float>?,
+        result: FootMeasurementGeometry.Result?,
+        rejectReason: String?
+    ) {
+        // ARKit's camera image is landscape; the app is portrait-only.
+        let photo = ScanRecorder.jpegData(from: frame.capturedImage, orientation: .right)
+        let meta = ScanBundleMeta(
+            id: ScanRecorder.newScanID(),
+            createdAt: ScanRecorder.timestamp(),
+            capturePath: "lidar",
+            side: side,
+            deviceModel: ScanRecorder.deviceModel(),
+            osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            appVersion: ScanRecorder.appVersion(),
+            algorithm: .current,
+            verticalAxis: 1,
+            seed: seed.map { [$0.x, $0.y] },
+            tapCenter: [scanCenter.x, scanCenter.y, scanCenter.z],
+            cropRadiusM: scanRadiusMeters,
+            framesFused: scanFrames.count,
+            pointCount: scanAccumPoints.count,
+            frames: scanFrames,
+            outcome: result == nil ? "rejected" : "measured",
+            rejectReason: rejectReason,
+            measurement: result?.measurement,
+            isolatedPointCount: result?.isolatedPoints.count,
+            hasPhoto: photo != nil
+        )
+        ScanRecorder.saveInBackground(
+            meta: meta,
+            points: scanAccumPoints,
+            frameIndex: scanAccumFrame,
+            photoJPEG: photo,
+            completion: onScanRecorded
+        )
+        resetScanAccumulation()
     }
 
     private func restoreDebugMeshes() {
@@ -257,16 +320,17 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         for anchor in frame.anchors {
             guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
             let verts = meshVertexWorldPositions(anchor: meshAnchor)
-            for v in verts where simd_distance(v, scanCenter) <= 0.22 {
-                appendScanPoints([v])
+            for v in verts where simd_distance(v, scanCenter) <= scanRadiusMeters {
+                appendScanPoints([v], frameIndex: ScanRecorder.meshFrameIndex)
             }
         }
 
         lastDepthSampleCount = scanAccumPoints.count
 
+        let seed = SIMD2<Float>(scanCenter.x, scanCenter.z)
+
         guard scanAccumPoints.count >= 80 else {
-            scanAccumPoints.removeAll(keepingCapacity: false)
-            scanVoxelKeys.removeAll(keepingCapacity: false)
+            recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "too_few_points")
             restoreDebugMeshes()
             onError?("Not enough fused points (\(lastDepthSampleCount)). Move closer, hold still, improve light, and try again.")
             return
@@ -274,13 +338,11 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 
         // Isolate + measure the foot the user tapped (seed = tap in world X/Z). The engine
         // strips the floor, drops the leg, and keeps the connected foot cluster.
-        let seed = SIMD2<Float>(scanCenter.x, scanCenter.z)
         guard let result = FootMeasurementGeometry.measure(
             points: scanAccumPoints, verticalAxis: 1, seed: seed
         ) else {
             removeFootPointCloud()
-            scanAccumPoints.removeAll(keepingCapacity: false)
-            scanVoxelKeys.removeAll(keepingCapacity: false)
+            recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "no_lock_on")
             restoreDebugMeshes()
             onError?("Couldn't lock onto a single foot (\(lastDepthSampleCount) pts). Put the foot flat on the floor, tap right on it, hold still, and try again.")
             return
@@ -288,8 +350,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 
         // Show ONLY the locked-on foot cluster (green) — visual confirmation of the lock.
         showFootPointCloud(points: result.isolatedPoints, cameraTransform: frame.camera.transform)
-        scanAccumPoints.removeAll(keepingCapacity: false)
-        scanVoxelKeys.removeAll(keepingCapacity: false)
+        recordScanAndReset(frame: frame, seed: seed, result: result, rejectReason: nil)
         let m = result.measurement
         statusLabel.text = String(
             format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
@@ -427,11 +488,18 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             let depthPts = FootDepthSampling.worldPointsNear(
                 frame: frame,
                 centerWorld: scanCenter,
-                radiusMeters: 0.22,
+                radiusMeters: scanRadiusMeters,
                 pixelStride: 2,
                 maxPoints: 8000
             )
-            appendScanPoints(depthPts)
+            let frameIndex = scanFrameCount - scanFramesRemaining
+            let added = appendScanPoints(depthPts, frameIndex: UInt8(frameIndex))
+            scanFrames.append(ScanBundleMeta.Frame(
+                index: frameIndex,
+                pointCount: added,
+                cameraTransform: ScanRecorder.flatten(frame.camera.transform),
+                attitudeQuat: nil
+            ))
             scanFramesRemaining -= 1
             if scanFramesRemaining == 0 {
                 finishFootScan(frame: frame)
@@ -587,12 +655,16 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 }
 
 struct ARFootScannerSheet: UIViewControllerRepresentable {
+    var side: String? = nil
     var onCaptured: (FootSideMeasurement) -> Void
     var onError: (String) -> Void
     var onDismiss: () -> Void
+    var onScanRecorded: () -> Void = {}
 
     func makeUIViewController(context: Context) -> FootScanARViewController {
         let c = FootScanARViewController()
+        c.side = side
+        c.onScanRecorded = onScanRecorded
         c.onCaptured = { m in
             onCaptured(m)
             // Brief delay so the dense green point cloud is visible before the sheet dismisses.

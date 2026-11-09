@@ -165,3 +165,99 @@ final class MeasurementModelsTests: XCTestCase {
         XCTAssertEqual(r.leftWidthCode, "standard")
     }
 }
+
+/// The on-disk layout is a contract with the Python reader (`server/scanlab/bundle.py`,
+/// checked against the same literal bytes in `server/tests/test_scanlab.py`).
+final class ScanRecorderTests: XCTestCase {
+    private func makeMeta(id: String) -> ScanBundleMeta {
+        ScanBundleMeta(
+            id: id,
+            createdAt: "2026-11-09T00:00:00Z",
+            capturePath: "lidar",
+            side: "left",
+            deviceModel: "iPhone16,1",
+            osVersion: "test",
+            appVersion: "1.0 (1)",
+            algorithm: .current,
+            verticalAxis: 1,
+            seed: [0.5, -0.25],
+            tapCenter: [0.5, 0, -0.25],
+            cropRadiusM: 0.22,
+            framesFused: 1,
+            pointCount: 2,
+            frames: [ScanBundleMeta.Frame(
+                index: 0, pointCount: 2,
+                cameraTransform: ScanRecorder.flatten(matrix_identity_float4x4),
+                attitudeQuat: nil
+            )],
+            outcome: "measured",
+            rejectReason: nil,
+            measurement: FootSideMeasurement(lengthMm: 270, ballWidthMm: 100, archHeightMm: 60),
+            isolatedPointCount: 2,
+            hasPhoto: false
+        )
+    }
+
+    private func makeTempRoot() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("scans-\(UUID().uuidString)")
+    }
+
+    func testWritesTightLittleEndianPointsAndSnakeCaseMeta() throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let points: [SIMD3<Float>] = [SIMD3<Float>(1, 2, 3), SIMD3<Float>(-0.5, 0, 0.25)]
+        let dir = try ScanRecorder.save(
+            meta: makeMeta(id: "scan-test"), points: points,
+            frameIndex: [0, ScanRecorder.meshFrameIndex], photoJPEG: nil, in: root
+        )
+
+        let pointBytes = [UInt8](try Data(contentsOf: dir.appendingPathComponent("points.f32")))
+        XCTAssertEqual(pointBytes, [
+            0x00, 0x00, 0x80, 0x3F,  0x00, 0x00, 0x00, 0x40,  0x00, 0x00, 0x40, 0x40,   // 1, 2, 3
+            0x00, 0x00, 0x00, 0xBF,  0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x80, 0x3E,   // -0.5, 0, 0.25
+        ])
+        let frameBytes = [UInt8](try Data(contentsOf: dir.appendingPathComponent("frame_index.u8")))
+        XCTAssertEqual(frameBytes, [0, 255])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("photo.jpg").path))
+
+        let raw = try Data(contentsOf: dir.appendingPathComponent("meta.json"))
+        let obj = try JSONSerialization.jsonObject(with: raw) as! [String: Any]
+        XCTAssertEqual(obj["schema_version"] as? Int, 1)
+        XCTAssertEqual(obj["capture_path"] as? String, "lidar")
+        XCTAssertEqual(obj["vertical_axis"] as? Int, 1)
+        XCTAssertEqual(obj["point_count"] as? Int, 2)
+        XCTAssertEqual(obj["outcome"] as? String, "measured")
+        XCTAssertEqual((obj["seed"] as? [Double])?.count, 2)
+        XCTAssertNotNil(obj["crop_radius_m"])
+        let measurement = obj["measurement"] as! [String: Any]
+        XCTAssertEqual(measurement["length_mm"] as? Double, 270)
+        XCTAssertEqual(measurement["ball_width_mm"] as? Double, 100)
+        let algorithm = obj["algorithm"] as! [String: Any]
+        XCTAssertEqual(algorithm["tip_correction_mm"] as? Double, FootMeasurementGeometry.tipCorrectionMm)
+        let frames = obj["frames"] as! [[String: Any]]
+        XCTAssertEqual((frames[0]["camera_transform"] as? [Double])?.count, 16)
+
+        // And it round-trips through the same snake_case decoding.
+        let dec = JSONDecoder()
+        dec.keyDecodingStrategy = .convertFromSnakeCase
+        XCTAssertEqual(try dec.decode(ScanBundleMeta.self, from: raw), makeMeta(id: "scan-test"))
+    }
+
+    func testListsOnlyCompleteBundlesAndDeletes() throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        XCTAssertTrue(ScanRecorder.bundleDirectories(in: root).isEmpty)
+
+        try ScanRecorder.save(meta: makeMeta(id: "scan-b"), points: [], frameIndex: [], photoJPEG: nil, in: root)
+        try ScanRecorder.save(meta: makeMeta(id: "scan-a"), points: [], frameIndex: [], photoJPEG: Data([1, 2]), in: root)
+        // A half-written bundle (no meta.json) must be ignored.
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("scan-partial"), withIntermediateDirectories: true
+        )
+
+        XCTAssertEqual(ScanRecorder.bundleDirectories(in: root).map(\.lastPathComponent), ["scan-a", "scan-b"])
+        ScanRecorder.deleteAll(in: root)
+        XCTAssertTrue(ScanRecorder.bundleDirectories(in: root).isEmpty)
+    }
+}
