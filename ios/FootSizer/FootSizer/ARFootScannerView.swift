@@ -87,6 +87,13 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         } else {
             config.sceneReconstruction = .mesh
         }
+        // The measurement is built from LiDAR depth frames; without these semantics
+        // `frame.sceneDepth` is nil and only the coarse scene mesh (~300 vertices) is left.
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            config.frameSemantics.insert(.smoothedSceneDepth)
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+        }
         // Skip HDR environment maps — reduces GPU work; not needed for foot mesh capture.
         config.environmentTexturing = .none
         // RealityKit scene graph updates must run on the main queue; default delegate queue is background.
@@ -347,6 +354,15 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         lastDepthSampleCount = scanAccumPoints.count
 
         let seed = SIMD2<Float>(scanCenter.x, scanCenter.z)
+
+        // The coarse scene mesh alone cannot describe a foot — never measure from it.
+        let depthPointCount = scanFrames.reduce(0) { $0 + $1.pointCount }
+        guard depthPointCount > 0 else {
+            recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "no_depth")
+            restoreDebugMeshes()
+            showProblem("No LiDAR depth reached the scanner. Hold the phone 30–50 cm above the foot and try again.")
+            return
+        }
 
         guard scanAccumPoints.count >= 80 else {
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "too_few_points")
