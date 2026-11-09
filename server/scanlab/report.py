@@ -360,12 +360,16 @@ def _scan_panels(r) -> str:
 
     # 6 — fusion: do successive frames land on top of each other?
     fi = b.frame_index
+    fusion_top = all_top if b.raw_points is None else [top(p) for p in b.raw_points]
+    if len(fusion_top) > 20000:      # raw sweeps hold hundreds of thousands of samples
+        step = len(fusion_top) // 20000 + 1
+        fusion_top, fi = fusion_top[::step], fi[::step]
     depth_frames = sorted({f for f in fi if f != MESH_FRAME_INDEX})
     if fi and len(depth_frames) > 1:
         groups = [[] for _ in range(N_RAMP)]
         mesh = []
         rank = {f: i for i, f in enumerate(depth_frames)}
-        for f, xy in zip(fi, all_top):
+        for f, xy in zip(fi, fusion_top):
             if f == MESH_FRAME_INDEX:
                 mesh.append(xy)
             else:

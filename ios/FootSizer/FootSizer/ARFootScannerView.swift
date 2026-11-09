@@ -38,17 +38,17 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     private var sweepStartTime: TimeInterval = 0
     private var lastSweepSampleTime: TimeInterval = 0
     private let sweepDuration: TimeInterval = 10
-    private let sweepSampleInterval: TimeInterval = 0.15
+    private let sweepSampleInterval: TimeInterval = 0.2
     /// `frame_index.u8` is one byte and 255 marks mesh vertices.
     private let maxSweepFrames = 200
     private var scanCenter: SIMD3<Float> = .zero
     private var scanAccumPoints: [SIMD3<Float>] = []
-    private var scanVoxelKeys: Set<String> = []
     /// Parallel to `scanAccumPoints`: which fused frame each point came from (recorded bundles).
     private var scanAccumFrame: [UInt8] = []
     private var scanFrames: [ScanBundleMeta.Frame] = []
     private let scanRadiusMeters: Float = 0.22
-    private let maxScanPoints = 120_000
+    /// Raw samples across the whole sweep (fused down by consensus before measuring).
+    private let maxScanPoints = 300_000
     private var footPointCloudAnchor: AnchorEntity?
     private static let startTitle = "Start scan"
 
@@ -97,9 +97,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         }
         // The measurement is built from LiDAR depth frames; without these semantics
         // `frame.sceneDepth` is nil and only the coarse scene mesh (~300 vertices) is left.
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            config.frameSemantics.insert(.smoothedSceneDepth)
-        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
         // Skip HDR environment maps — reduces GPU work; not needed for foot mesh capture.
@@ -254,30 +252,20 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         statusLabel.text = message
     }
 
-    private func quantKey(_ p: SIMD3<Float>) -> String {
-        "\(Int(p.x * 250))_\(Int(p.y * 250))_\(Int(p.z * 250))"
-    }
-
-    /// Adds voxel-deduplicated points tagged with their source frame; returns how many were new.
+    /// Appends one frame's raw samples (no de-duplication: fusion happens at the end, and
+    /// the raw frames are what gets recorded). Returns how many were added.
     @discardableResult
     private func appendScanPoints(_ pts: [SIMD3<Float>], frameIndex: UInt8) -> Int {
-        var added = 0
-        for p in pts {
-            let k = quantKey(p)
-            if scanVoxelKeys.insert(k).inserted {
-                scanAccumPoints.append(p)
-                scanAccumFrame.append(frameIndex)
-                added += 1
-                if scanAccumPoints.count >= maxScanPoints { break }
-            }
-        }
-        return added
+        let room = max(0, maxScanPoints - scanAccumPoints.count)
+        let take = pts.prefix(room)
+        scanAccumPoints.append(contentsOf: take)
+        scanAccumFrame.append(contentsOf: repeatElement(frameIndex, count: take.count))
+        return take.count
     }
 
     private func resetScanAccumulation() {
         scanAccumPoints.removeAll(keepingCapacity: false)
         scanAccumFrame.removeAll(keepingCapacity: false)
-        scanVoxelKeys.removeAll(keepingCapacity: false)
         scanFrames.removeAll(keepingCapacity: false)
     }
 
@@ -314,6 +302,8 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             hasPhoto: photo != nil
         )
         meta.heelHidden = result?.heelHidden
+        // Schema 2: points.f32 holds the raw per-frame samples; the engine input is their fusion.
+        meta.schemaVersion = 2
         ScanRecorder.saveInBackground(
             meta: meta,
             points: scanAccumPoints,
@@ -363,7 +353,9 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 
         // Only depth samples are measured. The scene mesh is too coarse (and lags a moving
         // leg), so its vertices are no longer mixed in.
-        lastDepthSampleCount = scanAccumPoints.count
+        // Consensus fusion: keep only surfaces that several frames agree on.
+        let fused = FootMeasurementGeometry.fuseFrames(points: scanAccumPoints, frameIndex: scanAccumFrame)
+        lastDepthSampleCount = fused.count
 
         let seed = SIMD2<Float>(scanCenter.x, scanCenter.z)
 
@@ -376,7 +368,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             return
         }
 
-        guard scanAccumPoints.count >= 80 else {
+        guard fused.count >= 80 else {
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "too_few_points")
             restoreDebugMeshes()
             showProblem("Not enough fused points (\(lastDepthSampleCount)). Move closer, improve light, and try again.")
@@ -386,7 +378,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         // Isolate + measure the foot the user tapped (seed = tap in world X/Z). The engine
         // strips the floor, drops the leg, and keeps the connected foot cluster.
         guard let result = FootMeasurementGeometry.measure(
-            points: scanAccumPoints, verticalAxis: 1, seed: seed
+            points: fused, verticalAxis: 1, seed: seed
         ) else {
             removeFootPointCloud()
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "no_lock_on")
@@ -554,7 +546,9 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
                     centerWorld: scanCenter,
                     radiusMeters: scanRadiusMeters,
                     pixelStride: 2,
-                    maxPoints: 8000
+                    maxPoints: 8000,
+                    preferSmoothed: false,
+                    minConfidence: 2
                 )
                 let frameIndex = scanFrames.count
                 let added = appendScanPoints(depthPts, frameIndex: UInt8(frameIndex))

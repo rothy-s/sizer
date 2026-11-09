@@ -144,3 +144,28 @@ def test_report_and_cli(tmp_path, capsys):
 
     replays = [replay(read_bundle(d)) for d in find_bundles([scans])]
     assert write_reports(replays, tmp_path / "again").name == "index.html"
+
+
+def test_fuse_frames_keeps_only_surfaces_several_frames_agree_on():
+    from foot_geometry_reference import fuse_frames
+
+    surface = [(0.001 * i + 0.0025, 0.001, 0.001) for i in range(0, 100, 5)]   # one per 5 mm voxel
+    points, frames = [], []
+    for f in range(9):
+        points += surface
+        frames += [f] * len(surface)
+        points.append((0.5 + 0.01 * f, 0.3, 0.0))                    # a stray seen by one frame only
+        frames.append(f)
+    fused = fuse_frames(points, bytes(frames))
+    assert len(fused) == len(surface)
+    assert all(abs(p[1] - 0.001) < 1e-6 for p in fused)
+
+
+def test_reads_raw_frame_bundle_and_fuses_it(tmp_path):
+    surface = [(0.001 * i + 0.0025, 0.001, 0.001) for i in range(0, 100, 5)]   # voxel centres
+    points = surface * 9
+    frames = bytes(f for f in range(9) for _ in surface)
+    d = write_bundle(tmp_path, _meta("scan-raw", schema_version=2), points, frames)
+    b = read_bundle(d)
+    assert len(b.raw_points) == len(points)
+    assert len(b.points) == len(surface)

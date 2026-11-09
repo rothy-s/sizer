@@ -14,9 +14,15 @@ enum FootDepthSampling {
         centerWorld: SIMD3<Float>,
         radiusMeters: Float,
         pixelStride: Int,
-        maxPoints: Int
+        maxPoints: Int,
+        preferSmoothed: Bool = true,
+        minConfidence: UInt8 = 1
     ) -> [SIMD3<Float>] {
-        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return [] }
+        // Smoothed depth averages over time, which lags (ghosts) while the phone moves.
+        let chosen = preferSmoothed
+            ? (frame.smoothedSceneDepth ?? frame.sceneDepth)
+            : (frame.sceneDepth ?? frame.smoothedSceneDepth)
+        guard let depthData = chosen else { return [] }
         let depthMap = depthData.depthMap
 
         let stride = max(1, pixelStride)
@@ -66,7 +72,7 @@ enum FootDepthSampling {
                 if let cm = confBuffer {
                     let coff = y * confBPR + x
                     let cptr = CVPixelBufferGetBaseAddress(cm)!.advanced(by: coff).assumingMemoryBound(to: UInt8.self)
-                    if cptr.pointee < 1 { continue }
+                    if cptr.pointee < minConfidence { continue }
                 }
 
                 guard let d = readDepth(

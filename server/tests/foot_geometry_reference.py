@@ -34,6 +34,8 @@ MAX_FLOOR_SLOPE = 0.12      # ignore a fitted floor steeper than this (m/m): not
 GRID_CELL_M = 0.01          # isolation grid
 TIP_CORRECTION_MM = 26.0    # add back the toe+heel taper lost at the floor-band cut
 MIN_POINTS = 80
+FUSE_VOXEL_M = 0.005        # sweep fusion voxel
+FUSE_MIN_FRAMES = 3         # a voxel must be seen in this many frames to count as surface
 
 
 @dataclass(frozen=True)
@@ -252,6 +254,44 @@ def _isolate_opened(points, a0, a1, seed):
             if count > best:
                 best, keep = count, g
     return [points[i] for k in sorted(keep) for i in cells[k]]
+
+
+def fuse_frames(points, frame_index, voxel_m: float = FUSE_VOXEL_M,
+                min_frames: int = FUSE_MIN_FRAMES):
+    """Fuse a sweep's raw per-frame depth samples into one cloud by consensus.
+
+    Frames taken while the phone moves disagree by 10-25 mm (pose drift, depth noise), so
+    a union of all samples turns every surface into a thick slab. Samples are binned into
+    `voxel_m` voxels; a voxel survives only when at least `min_frames` different frames
+    hit it (fewer for very short sweeps), and contributes the mean of its samples.
+
+    `frame_index[i]` is the frame of `points[i]`; samples of one frame must be contiguous.
+    Output order is first-seen voxel order; coordinates are rounded to float32 like Swift.
+    """
+    from array import array
+    n_frames = len(set(frame_index))
+    need = min(min_frames, max(1, n_frames // 3))
+    vox: dict = {}
+    for p, f in zip(points, frame_index):
+        k = (int(math.floor(p[0] / voxel_m)), int(math.floor(p[1] / voxel_m)),
+             int(math.floor(p[2] / voxel_m)))
+        v = vox.get(k)
+        if v is None:
+            vox[k] = [p[0], p[1], p[2], 1, f, 1]
+        else:
+            v[0] += p[0]
+            v[1] += p[1]
+            v[2] += p[2]
+            v[3] += 1
+            if v[4] != f:
+                v[4] = f
+                v[5] += 1
+    out = []
+    for v in vox.values():
+        if v[5] >= need:
+            c = array("f", [v[0] / v[3], v[1] / v[3], v[2] / v[3]])
+            out.append((c[0], c[1], c[2]))
+    return out
 
 
 def measure_foot(points, up: int = 1, seed=None,

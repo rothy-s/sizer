@@ -1,9 +1,14 @@
-"""On-disk scan bundle format (schema 1) — the Python mirror of `ScanRecorder.swift`.
+"""On-disk scan bundle format — the Python mirror of `ScanRecorder.swift`.
 
     <bundle>/meta.json        snake_case metadata (see `ScanBundleMeta` in Swift)
-    <bundle>/points.f32       little-endian float32 x,y,z triples, meters: the engine input
-    <bundle>/frame_index.u8   per point: fused frame it came from (255 = scene-mesh vertex)
+    <bundle>/points.f32       little-endian float32 x,y,z triples, meters
+    <bundle>/frame_index.u8   per point: frame it came from (255 = scene-mesh vertex)
     <bundle>/photo.jpg        optional camera photo
+
+Schema 1: `points.f32` is the engine input (already fused on the device).
+Schema 2: `points.f32` holds the raw per-frame depth samples of a sweep; the engine input
+is `fuse_frames(points, frame_index)`. `read_bundle` does that fusion, so `points` is
+always the engine input and `raw_points` keeps what was recorded.
 """
 
 from __future__ import annotations
@@ -15,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+RAW_FRAMES_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMAS = (SCHEMA_VERSION, RAW_FRAMES_SCHEMA_VERSION)
 MESH_FRAME_INDEX = 255
 
 
@@ -22,8 +29,9 @@ MESH_FRAME_INDEX = 255
 class ScanBundle:
     path: Path
     meta: dict
-    points: list            # [(x, y, z)] in meters
-    frame_index: bytes      # len == len(points), or empty when not recorded
+    points: list            # [(x, y, z)] in meters — the engine input
+    frame_index: bytes      # per recorded point, or empty when not recorded
+    raw_points: list | None = None   # schema 2: per-frame samples before fusion
 
     @property
     def id(self) -> str:
@@ -56,8 +64,8 @@ def read_bundle(path) -> ScanBundle:
     path = Path(path)
     meta = json.loads((path / "meta.json").read_text())
     version = meta.get("schema_version")
-    if version != SCHEMA_VERSION:
-        raise ValueError(f"{path.name}: unsupported schema_version {version!r} (reader is {SCHEMA_VERSION})")
+    if version not in SUPPORTED_SCHEMAS:
+        raise ValueError(f"{path.name}: unsupported schema_version {version!r} (reader supports {SUPPORTED_SCHEMAS})")
 
     raw = (path / "points.f32").read_bytes()
     if len(raw) % 12:
@@ -72,6 +80,10 @@ def read_bundle(path) -> ScanBundle:
     frame_index = fi_path.read_bytes() if fi_path.exists() else b""
     if frame_index and len(frame_index) != len(points):
         raise ValueError(f"{path.name}: frame_index.u8 has {len(frame_index)} entries for {len(points)} points")
+    if version == RAW_FRAMES_SCHEMA_VERSION:
+        from foot_geometry_reference import fuse_frames
+        fused = fuse_frames(points, frame_index)
+        return ScanBundle(path=path, meta=meta, points=fused, frame_index=frame_index, raw_points=points)
     return ScanBundle(path=path, meta=meta, points=points, frame_index=frame_index)
 
 

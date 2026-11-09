@@ -186,6 +186,49 @@ enum FootMeasurementGeometry {
         return Result(measurement: m, isolatedPoints: band, heelHidden: heelHidden)
     }
 
+    // MARK: - Sweep fusion
+
+    static let fuseVoxelM: Double = 0.005
+    static let fuseMinFrames = 3
+
+    /// Fuse a sweep's raw per-frame depth samples into one cloud by consensus (mirror of
+    /// `fuse_frames` in the Python reference).
+    ///
+    /// Frames taken while the phone moves disagree by 10–25 mm (pose drift, depth noise), so
+    /// a union of all samples turns every surface into a thick slab. Samples are binned into
+    /// `fuseVoxelM` voxels; a voxel survives only when at least `fuseMinFrames` different
+    /// frames hit it (fewer for very short sweeps) and contributes the mean of its samples.
+    /// Samples of one frame must be contiguous. Output is in first-seen voxel order.
+    static func fuseFrames(points: [SIMD3<Float>], frameIndex: [UInt8]) -> [SIMD3<Float>] {
+        struct Voxel: Hashable { let x: Int32; let y: Int32; let z: Int32 }
+        struct Acc { var sx: Double; var sy: Double; var sz: Double; var count: Int; var last: UInt8; var frames: Int }
+        let nFrames = Set(frameIndex).count
+        let need = min(fuseMinFrames, max(1, nFrames / 3))
+        var slot: [Voxel: Int] = [:]
+        var accs: [Acc] = []
+        for (p, f) in zip(points, frameIndex) {
+            let k = Voxel(
+                x: Int32((Double(p.x) / fuseVoxelM).rounded(.down)),
+                y: Int32((Double(p.y) / fuseVoxelM).rounded(.down)),
+                z: Int32((Double(p.z) / fuseVoxelM).rounded(.down))
+            )
+            if let i = slot[k] {
+                accs[i].sx += Double(p.x); accs[i].sy += Double(p.y); accs[i].sz += Double(p.z)
+                accs[i].count += 1
+                if accs[i].last != f { accs[i].last = f; accs[i].frames += 1 }
+            } else {
+                slot[k] = accs.count
+                accs.append(Acc(sx: Double(p.x), sy: Double(p.y), sz: Double(p.z), count: 1, last: f, frames: 1))
+            }
+        }
+        var out: [SIMD3<Float>] = []
+        for a in accs where a.frames >= need {
+            let n = Double(a.count)
+            out.append(SIMD3<Float>(Float(a.sx / n), Float(a.sy / n), Float(a.sz / n)))
+        }
+        return out
+    }
+
     // MARK: - Helpers (mirror the Python reference)
 
     private static func percentile(_ sorted: [Double], _ q: Double) -> Double {
