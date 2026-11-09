@@ -225,6 +225,8 @@ def _scan_panels(r) -> str:
         return ((p[a0] - ox) * 1000.0, (p[a1] - oy) * 1000.0)
 
     def height(p):
+        if st.floor_plane is not None:
+            return st.height_mm(p)
         return (p[up] - floor) * 1000.0
 
     all_top = [top(p) for p in b.points]
@@ -306,7 +308,7 @@ def _scan_panels(r) -> str:
         pl.bar(h0, bin_mm, c, cls, f"{h0:.0f} to {h0 + bin_mm:.0f} mm above floor: {c:,} points")
     pl.vline(0, "floor", strong=True)
     cards.append(_card("3 · Height histogram",
-                       "The floor is taken to be the tallest bar in the lower 60% of heights. A weak or split peak means a bad floor estimate.",
+                       "The floor starts at the tallest bar in the lower 60% of heights and is then fitted as a tilted plane. A weak or split peak means a bad floor estimate.",
                        _legend([("keep", "heights kept"), ("drop", "heights dropped")]),
                        pl.svg("Histogram of point heights above the detected floor")))
 

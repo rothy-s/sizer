@@ -6,9 +6,14 @@ without ARKit. Pure Python (no numpy) so it stays dependency-light and trivially
 comparable to the simd-based Swift port.
 
 Pipeline (gravity-aligned input; `up` selects the vertical axis):
-  1. Floor plane = tallest histogram bin of the vertical coordinate (lower 60% of range).
+  1. Floor plane = tallest histogram bin of the vertical coordinate (lower 60% of range),
+     refined by a least-squares plane fit (real floors read 2-4 mm/100 mm off level).
   2. Keep points from floor+FLOOR_BAND_MM up to LEG_CAP_MM (drops floor + attached shin).
-  3. Isolate the foot: connected component containing the tap seed (or largest component).
+     Under a leg column (a 10 mm cell holding points above the cap) keep only points up
+     to LEG_SHADOW_CAP_MM: anything higher there is shin or trouser, not foot.
+  3. Isolate the foot: morphological opening on a 10 mm grid (drops thin streaks such as
+     a trouser edge or a neighbouring foot's rim), then the connected component at the
+     tap seed (or the largest one). Sparse clouds fall back to 20 mm-cell clustering.
   4. PCA in the horizontal plane -> long axis (heel->toe), rotation-invariant.
   5. length  = principal-axis extent (robust percentiles) + TIP_CORRECTION_MM (taper inset).
      width   = max secondary-axis extent within the forefoot region (the "ball").
@@ -24,6 +29,9 @@ from dataclasses import dataclass, field
 # 235-320 mm and yaw 0-120 deg: width within 3 mm 98% of the time, length within 6 mm 85%.
 FLOOR_BAND_MM = 10.0        # cut this far above the floor plane (clears noisy floor slab)
 LEG_CAP_MM = 95.0           # ignore points taller than this (attached ankle/shin)
+LEG_SHADOW_CAP_MM = 60.0    # height cap inside a leg column (cell with points above LEG_CAP_MM)
+MAX_FLOOR_SLOPE = 0.12      # ignore a fitted floor steeper than this (m/m): not a floor
+GRID_CELL_M = 0.01          # isolation grid
 TIP_CORRECTION_MM = 26.0    # add back the toe+heel taper lost at the floor-band cut
 MIN_POINTS = 80
 
@@ -47,7 +55,13 @@ class FootStages:
     a0: int                                 # horizontal axis indices
     a1: int
     n_input: int
-    floor: float | None = None              # vertical coordinate of the floor plane (m)
+    floor: float | None = None              # vertical coordinate of the floor level (m)
+    # Fitted floor: vertical = a*p[a0] + b*p[a1] + c. Use `height_mm` for heights.
+    floor_plane: tuple | None = None
+    leg_cells: set = field(default_factory=set)     # 10 mm cells holding points above the leg cap
+    # True when the leg sits at the end of the visible foot, i.e. the heel was not seen
+    # and `length_mm` only covers toe -> front of the ankle.
+    heel_hidden: bool = False
     above: list = field(default_factory=list)   # points kept by the floor/leg height band
     band: list = field(default_factory=list)    # the isolated foot cluster
     centroid: tuple | None = None           # (a0, a1) mean of the cluster
@@ -58,6 +72,13 @@ class FootStages:
     ball_width_mm: float | None = None
     instep_mm: float | None = None
     measurement: FootMeasurement | None = None
+
+    def height_mm(self, p) -> float:
+        """Height of `p` above the fitted floor, in mm."""
+        if self.floor_plane is not None:
+            a, b, c = self.floor_plane
+            return (p[self.up] - (a * p[self.a0] + b * p[self.a1] + c)) * 1000.0
+        return (p[self.up] - (self.floor or 0.0)) * 1000.0
     reject_reason: str | None = None        # None when a measurement was produced
 
 
@@ -138,6 +159,101 @@ def _isolate(points, a0, a1, cell_m, seed):
     return [points[i] for c in comp for i in cells[c]]
 
 
+def _fit_floor_plane(points, up, a0, a1, level):
+    """Least-squares plane through the points near `level`: vertical = a*h0 + b*h1 + c.
+
+    Three passes with a tightening inlier band. Falls back to the level plane when the
+    fit is degenerate or steeper than MAX_FLOOR_SLOPE.
+    """
+    a = b = 0.0
+    c = level
+    for tol in (0.015, 0.008, 0.006):
+        sel = [p for p in points if abs(p[up] - (a * p[a0] + b * p[a1] + c)) <= tol]
+        n = len(sel)
+        if n < 50:
+            break
+        mx = sum(p[a0] for p in sel) / n
+        my = sum(p[a1] for p in sel) / n
+        mz = sum(p[up] for p in sel) / n
+        sxx = sxy = syy = sxz = syz = 0.0
+        for p in sel:
+            dx = p[a0] - mx
+            dy = p[a1] - my
+            dz = p[up] - mz
+            sxx += dx * dx
+            sxy += dx * dy
+            syy += dy * dy
+            sxz += dx * dz
+            syz += dy * dz
+        det = sxx * syy - sxy * sxy
+        if abs(det) < 1e-12:
+            break
+        a = (sxz * syy - syz * sxy) / det
+        b = (syz * sxx - sxz * sxy) / det
+        c = mz - a * mx - b * my
+    if abs(a) > MAX_FLOOR_SLOPE or abs(b) > MAX_FLOOR_SLOPE:
+        return 0.0, 0.0, level
+    return a, b, c
+
+
+def _cell(p, a0, a1, cell_m=GRID_CELL_M):
+    return (int(math.floor(p[a0] / cell_m)), int(math.floor(p[a1] / cell_m)))
+
+
+def _neighbours(k):
+    return [(k[0] + dx, k[1] + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+
+
+def _isolate_opened(points, a0, a1, seed):
+    """Foot cluster via morphological opening on the 10 mm grid.
+
+    A cell is *core* when at least 7 of its 3x3 block are occupied; cores form connected
+    components; the chosen component (nearest the seed, else the most points) is grown
+    back by one cell. Structures under ~30 mm wide never form a core, so they drop out.
+    Returns [] when the cloud is too sparse to have any core cell.
+    """
+    cells: dict = {}
+    for i, p in enumerate(points):
+        cells.setdefault(_cell(p, a0, a1), []).append(i)
+    core = {k for k in cells if sum(1 for q in _neighbours(k) if q in cells) >= 7}
+    if not core:
+        return []
+
+    def component(start):
+        seen = {start}
+        stack = [start]
+        while stack:
+            k = stack.pop()
+            for q in _neighbours(k):
+                if q in core and q not in seen:
+                    seen.add(q)
+                    stack.append(q)
+        return seen
+
+    def grown(comp):
+        return {q for k in comp for q in _neighbours(k) if q in cells}
+
+    if seed is not None:
+        sk = (int(math.floor(seed[0] / GRID_CELL_M)), int(math.floor(seed[1] / GRID_CELL_M)))
+        # Deterministic tie-break (distance, then cell) so Swift and Python agree.
+        start = min(core, key=lambda k: ((k[0] - sk[0]) ** 2 + (k[1] - sk[1]) ** 2, k))
+        keep = grown(component(start))
+    else:
+        keep = set()
+        best = -1
+        seen: set = set()
+        for start in sorted(core):
+            if start in seen:
+                continue
+            comp = component(start)
+            seen |= comp
+            g = grown(comp)
+            count = sum(len(cells[k]) for k in g)
+            if count > best:
+                best, keep = count, g
+    return [points[i] for k in sorted(keep) for i in cells[k]]
+
+
 def measure_foot(points, up: int = 1, seed=None,
                  floor_band_mm: float = FLOOR_BAND_MM,
                  leg_cap_mm: float = LEG_CAP_MM,
@@ -177,15 +293,31 @@ def measure_foot_stages(points, up: int = 1, seed=None,
     vert = sorted(p[up] for p in points)
     floor = _floor_level(vert)
     st.floor = floor
+    plane = _fit_floor_plane(points, up, a0, a1, floor)
+    st.floor_plane = plane
+    pa, pb, pc = plane
 
-    above = [p for p in points
-             if floor_band_mm < (p[up] - floor) * 1000.0 <= leg_cap_mm]
+    def height(p):
+        return (p[up] - (pa * p[a0] + pb * p[a1] + pc)) * 1000.0
+
+    heights = [height(p) for p in points]
+    leg_cells = {_cell(p, a0, a1) for p, h in zip(points, heights) if h > leg_cap_mm}
+    st.leg_cells = leg_cells
+    above = []
+    for p, h in zip(points, heights):
+        if not floor_band_mm < h <= leg_cap_mm:
+            continue
+        if h > LEG_SHADOW_CAP_MM and _cell(p, a0, a1) in leg_cells:
+            continue
+        above.append(p)
     st.above = above
     if len(above) < min_points:
         st.reject_reason = "too_few_above_floor"
         return st
 
-    band = _isolate(above, a0, a1, 0.02, seed)
+    band = _isolate_opened(above, a0, a1, seed)
+    if len(band) < min_points:
+        band = _isolate(above, a0, a1, 0.02, seed)
     st.band = band
     n = len(band)
     if n < min_points:
@@ -223,7 +355,7 @@ def measure_foot_stages(points, up: int = 1, seed=None,
     for p in band:
         da = p[a0] - ma
         db = p[a1] - mb
-        proj.append((da * ux + db * uy, da * vx + db * vy, (p[up] - floor) * 1000.0))
+        proj.append((da * ux + db * uy, da * vx + db * vy, height(p)))
 
     ts = sorted(t for t, _, _ in proj)
     tmin = _percentile(ts, 0.005)
@@ -231,6 +363,22 @@ def measure_foot_stages(points, up: int = 1, seed=None,
     span = tmax - tmin or 1.0
     length_mm = span * 1000.0 + tip_correction_mm
     st.tmin, st.tmax = tmin, tmax
+
+    # Heel hidden? When the leg block attached to the cluster is centred at (or beyond)
+    # an end of the visible extent, the camera saw toe -> ankle only.
+    band_cells = {_cell(p, a0, a1) for p in band}
+    block = {k for k in leg_cells if any(q in band_cells for q in _neighbours(k))}
+    stack = list(block)
+    while stack:
+        k = stack.pop()
+        for q in _neighbours(k):
+            if q in leg_cells and q not in block:
+                block.add(q)
+                stack.append(q)
+    if block:
+        lt = sum(((k[0] + 0.5) * GRID_CELL_M - ma) * ux + ((k[1] + 0.5) * GRID_CELL_M - mb) * uy
+                 for k in block) / len(block)
+        st.heel_hidden = lt < tmin + 0.10 * span or lt > tmax - 0.10 * span
 
     def width_in(lo_frac, hi_frac):
         lo = tmin + lo_frac * span

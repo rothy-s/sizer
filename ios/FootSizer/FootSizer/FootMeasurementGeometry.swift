@@ -8,9 +8,14 @@ import simd
 /// scene, floor included, and inflated "length" when a foot sat at an angle) with a real
 /// pipeline that **locks onto the foot**:
 ///
-///   1. Floor plane = tallest histogram bin of the vertical coordinate (lower 60% of range).
+///   1. Floor plane = tallest histogram bin of the vertical coordinate (lower 60% of range),
+///      refined by a least-squares plane fit (real floors read 2–4 mm/100 mm off level).
 ///   2. Keep points from floor+`floorBandMm` up to `legCapMm` (drops floor + attached shin).
-///   3. Isolate the foot: connected component containing the tap seed (or largest component).
+///      Under a leg column (a 10 mm cell holding points above the cap) keep only points up
+///      to `legShadowCapMm`: anything higher there is shin or trouser, not foot.
+///   3. Isolate the foot: morphological opening on a 10 mm grid (drops thin streaks such as
+///      a trouser edge or a neighbouring foot's rim), then the connected component at the
+///      tap seed (or the largest one). Sparse clouds fall back to 20 mm-cell clustering.
 ///   4. PCA in the horizontal plane → long axis (heel→toe) — rotation invariant.
 ///   5. length = principal-axis extent (robust percentiles) + `tipCorrectionMm` (taper inset);
 ///      ball width = max secondary extent in the forefoot region;
@@ -21,6 +26,9 @@ enum FootMeasurementGeometry {
     // width within 3 mm 98% of the time, length within 6 mm 85%, across sizes and rotations.
     static let floorBandMm: Double = 10.0
     static let legCapMm: Double = 95.0
+    static let legShadowCapMm: Double = 60.0
+    static let maxFloorSlope: Double = 0.12
+    static let gridCellM: Double = 0.01
     static let tipCorrectionMm: Double = 26.0
     static let defaultMinPointCount = 80
 
@@ -28,6 +36,9 @@ enum FootMeasurementGeometry {
         let measurement: FootSideMeasurement
         /// The isolated foot cluster (world/reference space) — used to draw the lock-on cloud.
         let isolatedPoints: [SIMD3<Float>]
+        /// True when the leg sits at the end of the visible foot: the heel was not seen and
+        /// `lengthMm` only covers toe → front of the ankle (too short). Width is unaffected.
+        let heelHidden: Bool
     }
 
     /// ARKit world: **Y** up (index 1); horizontal footprint spans X and Z.
@@ -64,17 +75,33 @@ enum FootMeasurementGeometry {
         let a0 = horiz[0], a1 = horiz[1]
 
         let vertSorted = points.map { $0[up] }.sorted()
-        let floor = floorLevel(vertSorted)
+        let level = floorLevel(vertSorted)
+        let plane = fitFloorPlane(points, up: up, a0: a0, a1: a1, level: Double(level))
 
-        // Thin floor cut (keeps low tapering toe/heel tips) up to a height cap that drops a shin.
-        let above = points.filter {
-            let h = Double($0[up] - floor) * 1000.0
-            return h > floorBandMm && h <= legCapMm
+        func height(_ p: SIMD3<Float>) -> Double {
+            (Double(p[up]) - (plane.a * Double(p[a0]) + plane.b * Double(p[a1]) + plane.c)) * 1000.0
+        }
+
+        let heights = points.map(height)
+        var legCells = Set<Cell>()
+        for (p, h) in zip(points, heights) where h > legCapMm {
+            legCells.insert(cellKey(p, a0, a1, gridCellM))
+        }
+        // Thin floor cut (keeps low tapering toe/heel tips) up to a height cap that drops a
+        // shin; under a leg column only low points can be foot.
+        var above: [SIMD3<Float>] = []
+        for (p, h) in zip(points, heights) {
+            guard h > floorBandMm, h <= legCapMm else { continue }
+            if h > legShadowCapMm, legCells.contains(cellKey(p, a0, a1, gridCellM)) { continue }
+            above.append(p)
         }
         guard above.count >= minPointCount else { return nil }
 
         // Isolate the foot cluster the user aimed at (seed) or the dominant one.
-        let band = isolate(above, a0: a0, a1: a1, cell: 0.02, seed: seed)
+        var band = isolateOpened(above, a0: a0, a1: a1, seed: seed)
+        if band.count < minPointCount {
+            band = isolate(above, a0: a0, a1: a1, cell: 0.02, seed: seed)
+        }
         let n = band.count
         guard n >= minPointCount else { return nil }
 
@@ -110,7 +137,7 @@ enum FootMeasurementGeometry {
         for p in band {
             let da = Double(p[a0]) - ma
             let db = Double(p[a1]) - mb
-            proj.append((da * ux + db * uy, da * vx + db * vy, Double(p[up] - floor) * 1000.0))
+            proj.append((da * ux + db * uy, da * vx + db * vy, height(p)))
         }
 
         let ts = proj.map { $0.t }.sorted()
@@ -118,6 +145,27 @@ enum FootMeasurementGeometry {
         let tmax = percentile(ts, 0.995)
         let span = (tmax - tmin) == 0 ? 1.0 : (tmax - tmin)
         let lengthMm = span * 1000.0 + tipCorrectionMm
+
+        // Heel hidden? When the leg block attached to the cluster is centred at (or beyond)
+        // an end of the visible extent, the camera saw toe → ankle only.
+        var heelHidden = false
+        let bandCells = Set(band.map { cellKey($0, a0, a1, gridCellM) })
+        var block = Set(legCells.filter { k in neighbours(k).contains { bandCells.contains($0) } })
+        var stack = Array(block)
+        while let k = stack.popLast() {
+            for q in neighbours(k) where legCells.contains(q) && !block.contains(q) {
+                block.insert(q)
+                stack.append(q)
+            }
+        }
+        if !block.isEmpty {
+            var lt = 0.0
+            for k in block {
+                lt += ((Double(k.x) + 0.5) * gridCellM - ma) * ux + ((Double(k.y) + 0.5) * gridCellM - mb) * uy
+            }
+            lt /= Double(block.count)
+            heelHidden = lt < tmin + 0.10 * span || lt > tmax - 0.10 * span
+        }
 
         func widthIn(_ loFrac: Double, _ hiFrac: Double) -> Double {
             let lo = tmin + loFrac * span
@@ -135,7 +183,7 @@ enum FootMeasurementGeometry {
 
         guard lengthMm > 120, lengthMm < 400, ballWidthMm > 40, ballWidthMm < 200 else { return nil }
         let m = FootSideMeasurement(lengthMm: lengthMm, ballWidthMm: ballWidthMm, archHeightMm: instepMm)
-        return Result(measurement: m, isolatedPoints: band)
+        return Result(measurement: m, isolatedPoints: band, heelHidden: heelHidden)
     }
 
     // MARK: - Helpers (mirror the Python reference)
@@ -170,6 +218,104 @@ enum FootMeasurementGeometry {
     }
 
     private struct Cell: Hashable { let x: Int; let y: Int }
+
+    private static func neighbours(_ k: Cell) -> [Cell] {
+        var out: [Cell] = []
+        out.reserveCapacity(9)
+        for dx in -1...1 { for dy in -1...1 { out.append(Cell(x: k.x + dx, y: k.y + dy)) } }
+        return out
+    }
+
+    /// Least-squares plane through the points near `level`: vertical = a·h0 + b·h1 + c.
+    /// Three passes with a tightening inlier band; falls back to the level plane when the
+    /// fit is degenerate or steeper than `maxFloorSlope`.
+    private static func fitFloorPlane(
+        _ points: [SIMD3<Float>], up: Int, a0: Int, a1: Int, level: Double
+    ) -> (a: Double, b: Double, c: Double) {
+        var a = 0.0, b = 0.0, c = level
+        for tol in [0.015, 0.008, 0.006] {
+            var n = 0
+            var sx = 0.0, sy = 0.0, sz = 0.0
+            var sel: [(Double, Double, Double)] = []
+            for p in points {
+                let x = Double(p[a0]), y = Double(p[a1]), z = Double(p[up])
+                if abs(z - (a * x + b * y + c)) <= tol {
+                    sel.append((x, y, z)); sx += x; sy += y; sz += z; n += 1
+                }
+            }
+            if n < 50 { break }
+            let mx = sx / Double(n), my = sy / Double(n), mz = sz / Double(n)
+            var sxx = 0.0, sxy = 0.0, syy = 0.0, sxz = 0.0, syz = 0.0
+            for (x, y, z) in sel {
+                let dx = x - mx, dy = y - my, dz = z - mz
+                sxx += dx * dx; sxy += dx * dy; syy += dy * dy; sxz += dx * dz; syz += dy * dz
+            }
+            let det = sxx * syy - sxy * sxy
+            if abs(det) < 1e-12 { break }
+            a = (sxz * syy - syz * sxy) / det
+            b = (syz * sxx - sxz * sxy) / det
+            c = mz - a * mx - b * my
+        }
+        if abs(a) > maxFloorSlope || abs(b) > maxFloorSlope { return (0, 0, level) }
+        return (a, b, c)
+    }
+
+    /// Foot cluster via morphological opening on the 10 mm grid. A cell is *core* when at
+    /// least 7 of its 3×3 block are occupied; cores form connected components; the chosen
+    /// component (nearest the seed, else the most points) is grown back by one cell.
+    /// Structures under ~30 mm wide never form a core, so they drop out. Returns [] when
+    /// the cloud is too sparse to have any core cell.
+    private static func isolateOpened(
+        _ points: [SIMD3<Float>], a0: Int, a1: Int, seed: SIMD2<Float>?
+    ) -> [SIMD3<Float>] {
+        var cells: [Cell: [Int]] = [:]
+        for (i, p) in points.enumerated() {
+            cells[cellKey(p, a0, a1, gridCellM), default: []].append(i)
+        }
+        let core = Set(cells.keys.filter { k in
+            neighbours(k).reduce(0) { $0 + (cells[$1] != nil ? 1 : 0) } >= 7
+        })
+        if core.isEmpty { return [] }
+
+        func component(from start: Cell) -> Set<Cell> {
+            var seen: Set<Cell> = [start]
+            var stack = [start]
+            while let k = stack.popLast() {
+                for q in neighbours(k) where core.contains(q) && !seen.contains(q) {
+                    seen.insert(q)
+                    stack.append(q)
+                }
+            }
+            return seen
+        }
+        func grown(_ comp: Set<Cell>) -> Set<Cell> {
+            var out = Set<Cell>()
+            for k in comp { for q in neighbours(k) where cells[q] != nil { out.insert(q) } }
+            return out
+        }
+        func ordered(_ a: Cell, _ b: Cell) -> Bool { a.x != b.x ? a.x < b.x : a.y < b.y }
+
+        var keep = Set<Cell>()
+        if let seed = seed {
+            let sk = Cell(x: Int((Double(seed.x) / gridCellM).rounded(.down)),
+                          y: Int((Double(seed.y) / gridCellM).rounded(.down)))
+            func d2(_ k: Cell) -> Int { (k.x - sk.x) * (k.x - sk.x) + (k.y - sk.y) * (k.y - sk.y) }
+            // Deterministic tie-break (distance, then cell) so Swift and Python agree.
+            let start = core.min { d2($0) != d2($1) ? d2($0) < d2($1) : ordered($0, $1) }!
+            keep = grown(component(from: start))
+        } else {
+            var best = -1
+            var seen = Set<Cell>()
+            for start in core.sorted(by: ordered) where !seen.contains(start) {
+                let comp = component(from: start)
+                seen.formUnion(comp)
+                let g = grown(comp)
+                let count = g.reduce(0) { $0 + (cells[$1]?.count ?? 0) }
+                if count > best { best = count; keep = g }
+            }
+        }
+        return keep.sorted(by: ordered).flatMap { cells[$0] ?? [] }.map { points[$0] }
+    }
 
     private static func cellKey(_ p: SIMD3<Float>, _ a0: Int, _ a1: Int, _ cell: Double) -> Cell {
         Cell(x: Int((Double(p[a0]) / cell).rounded(.down)),

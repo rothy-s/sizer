@@ -68,13 +68,16 @@ def _checks(bundle: ScanBundle, st: FootStages, floor_band_mm: float) -> list[st
     meta = bundle.meta
     n = len(bundle.points)
     if st.floor is not None and n:
-        near = sum(1 for p in bundle.points if abs(p[st.up] - st.floor) * 1000.0 <= floor_band_mm)
+        near = sum(1 for p in bundle.points if abs(st.height_mm(p)) <= floor_band_mm)
         if near / n < 0.15:
             out.append(f"Only {near / n:.0%} of points lie within {floor_band_mm:.0f} mm of the "
                        "detected floor — the floor plane may be misplaced.")
     if st.above and st.band and len(st.band) / len(st.above) < 0.5:
         out.append(f"The locked-on cluster holds only {len(st.band) / len(st.above):.0%} of the "
                    "points above the floor — it may have locked onto the wrong object.")
+    if st.heel_hidden:
+        out.append("The heel is hidden behind the leg, so the length only covers toe to ankle "
+                   "and is too short. Width is unaffected.")
     if st.length_mm and st.ball_width_mm:
         aspect = st.length_mm / st.ball_width_mm
         if not 2.1 <= aspect <= 3.1:

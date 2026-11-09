@@ -31,18 +31,26 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     /// RealityKit entities for scene mesh (bright blue); keyed by `ARMeshAnchor.identifier`.
     private var meshAnchorEntities = [UUID: AnchorEntity]()
 
-    /// High-res depth accumulation (0 = idle).
-    private var scanFramesRemaining: Int = 0
+    /// Sweep capture: depth frames are fused in ARKit world space while the user moves the
+    /// phone around the foot, so the heel (hidden behind the leg from above) gets seen.
+    private var sweepActive = false
+    private var sweepFinishRequested = false
+    private var sweepStartTime: TimeInterval = 0
+    private var lastSweepSampleTime: TimeInterval = 0
+    private let sweepDuration: TimeInterval = 10
+    private let sweepSampleInterval: TimeInterval = 0.15
+    /// `frame_index.u8` is one byte and 255 marks mesh vertices.
+    private let maxSweepFrames = 200
     private var scanCenter: SIMD3<Float> = .zero
     private var scanAccumPoints: [SIMD3<Float>] = []
     private var scanVoxelKeys: Set<String> = []
     /// Parallel to `scanAccumPoints`: which fused frame each point came from (recorded bundles).
     private var scanAccumFrame: [UInt8] = []
     private var scanFrames: [ScanBundleMeta.Frame] = []
-    private let scanFrameCount = 10
     private let scanRadiusMeters: Float = 0.22
-    private let maxScanPoints = 40_000
+    private let maxScanPoints = 120_000
     private var footPointCloudAnchor: AnchorEntity?
+    private static let startTitle = "Start scan"
 
     /// Unlit so the mesh stays visible in AR (lit `SimpleMaterial` can look black with no scene lights).
     private static func sceneMeshMaterial() -> RealityKit.Material {
@@ -107,7 +115,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         statusLabel.textColor = .white
         statusLabel.numberOfLines = 0
         statusLabel.font = .preferredFont(forTextStyle: .footnote)
-        statusLabel.text = "Scan the floor slowly first. Point at a foot, tap where it sits, then Capture — we fuse many LiDAR depth frames for a dense green point cloud."
+        statusLabel.text = "Roll up your trouser leg. Point at the foot, tap it, then Start scan and move the phone slowly around the foot, low and round to the heel."
         view.addSubview(statusLabel)
 
         trackingWarningLabel = UILabel()
@@ -132,7 +140,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         ])
 
         captureButton = UIButton(type: .system)
-        captureButton.setTitle("Capture (high-res depth)", for: .normal)
+        captureButton.setTitle(Self.startTitle, for: .normal)
         captureButton.titleLabel?.font = .boldSystemFont(ofSize: 17)
         captureButton.backgroundColor = UIColor.systemBlue
         captureButton.setTitleColor(.white, for: .normal)
@@ -185,11 +193,14 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     @objc private func screenTapped(_ gr: UITapGestureRecognizer) {
         lastTapScreenPoint = gr.location(in: arView)
         statusLabel.textColor = .white
-        statusLabel.text = "Tap Capture to sample mesh near this point."
+        if !sweepActive { statusLabel.text = "Tap Start scan, then move the phone slowly around the foot." }
     }
 
     @objc private func captureTapped() {
-        guard scanFramesRemaining == 0 else { return }
+        if sweepActive {
+            sweepFinishRequested = true
+            return
+        }
 
         guard let point = lastTapScreenPoint else {
             statusLabel.text = "Tap on the foot in the AR view first."
@@ -213,15 +224,19 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 
         scanCenter = hit
         resetScanAccumulation()
-        scanFramesRemaining = scanFrameCount
+        sweepActive = true
+        sweepFinishRequested = false
+        sweepStartTime = 0
+        lastSweepSampleTime = 0
         lastDepthSampleCount = 0
-        captureButton.isEnabled = false
+        removeFootPointCloud()
+        captureButton.setTitle("Finish scan", for: .normal)
         arView.debugOptions.remove(.showSceneUnderstanding)
         for e in meshAnchorEntities.values {
             e.isEnabled = false
         }
         statusLabel.textColor = .white
-        statusLabel.text = "Hold still — fusing LiDAR depth (10 frames)…"
+        statusLabel.text = "Move the phone slowly around the foot — go low and round to the heel."
     }
 
     /// World point under a screen point from ARKit's raycast (LiDAR depth backed), nearest first.
@@ -276,7 +291,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     ) {
         // ARKit's camera image is landscape; the app is portrait-only.
         let photo = ScanRecorder.jpegData(from: frame.capturedImage, orientation: .right)
-        let meta = ScanBundleMeta(
+        var meta = ScanBundleMeta(
             id: ScanRecorder.newScanID(),
             createdAt: ScanRecorder.timestamp(),
             capturePath: "lidar",
@@ -298,6 +313,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             isolatedPointCount: result?.isolatedPoints.count,
             hasPhoto: photo != nil
         )
+        meta.heelHidden = result?.heelHidden
         ScanRecorder.saveInBackground(
             meta: meta,
             points: scanAccumPoints,
@@ -341,16 +357,12 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     }
 
     private func finishFootScan(frame: ARFrame) {
-        captureButton.isEnabled = true
+        sweepActive = false
+        sweepFinishRequested = false
+        captureButton.setTitle(Self.startTitle, for: .normal)
 
-        for anchor in frame.anchors {
-            guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
-            let verts = meshVertexWorldPositions(anchor: meshAnchor)
-            for v in verts where simd_distance(v, scanCenter) <= scanRadiusMeters {
-                appendScanPoints([v], frameIndex: ScanRecorder.meshFrameIndex)
-            }
-        }
-
+        // Only depth samples are measured. The scene mesh is too coarse (and lags a moving
+        // leg), so its vertices are no longer mixed in.
         lastDepthSampleCount = scanAccumPoints.count
 
         let seed = SIMD2<Float>(scanCenter.x, scanCenter.z)
@@ -367,7 +379,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         guard scanAccumPoints.count >= 80 else {
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "too_few_points")
             restoreDebugMeshes()
-            showProblem("Not enough fused points (\(lastDepthSampleCount)). Move closer, hold still, improve light, and try again.")
+            showProblem("Not enough fused points (\(lastDepthSampleCount)). Move closer, improve light, and try again.")
             return
         }
 
@@ -379,7 +391,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             removeFootPointCloud()
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "no_lock_on")
             restoreDebugMeshes()
-            showProblem("Couldn't lock onto a single foot (\(lastDepthSampleCount) pts). Put the foot flat on the floor, tap right on it, hold still, and try again.")
+            showProblem("Couldn't lock onto a single foot (\(lastDepthSampleCount) pts). Put the foot flat on the floor, tap right on it, sweep slowly, and try again.")
             return
         }
 
@@ -387,11 +399,19 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         showFootPointCloud(points: result.isolatedPoints, cameraTransform: frame.camera.transform)
         recordScanAndReset(frame: frame, seed: seed, result: result, rejectReason: nil)
         let m = result.measurement
-        statusLabel.textColor = .white
-        statusLabel.text = String(
-            format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
-            m.lengthMm, m.ballWidthMm, m.archHeightMm, result.isolatedPoints.count
-        )
+        if result.heelHidden {
+            statusLabel.textColor = .systemYellow
+            statusLabel.text = String(
+                format: "Width %.0f mm ✓  Heel hidden behind your leg — length (%.0f mm) is toe to ankle only and too short.",
+                m.ballWidthMm, m.lengthMm
+            )
+        } else {
+            statusLabel.textColor = .white
+            statusLabel.text = String(
+                format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
+                m.lengthMm, m.ballWidthMm, m.archHeightMm, result.isolatedPoints.count
+            )
+        }
         onCaptured?(m)
     }
 
@@ -520,24 +540,36 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             }
         }
 
-        if scanFramesRemaining > 0 {
-            let depthPts = FootDepthSampling.worldPointsNear(
-                frame: frame,
-                centerWorld: scanCenter,
-                radiusMeters: scanRadiusMeters,
-                pixelStride: 2,
-                maxPoints: 8000
-            )
-            let frameIndex = scanFrameCount - scanFramesRemaining
-            let added = appendScanPoints(depthPts, frameIndex: UInt8(frameIndex))
-            scanFrames.append(ScanBundleMeta.Frame(
-                index: frameIndex,
-                pointCount: added,
-                cameraTransform: ScanRecorder.flatten(frame.camera.transform),
-                attitudeQuat: nil
-            ))
-            scanFramesRemaining -= 1
-            if scanFramesRemaining == 0 {
+        if sweepActive {
+            if sweepStartTime == 0 { sweepStartTime = now }
+            let elapsed = now - sweepStartTime
+            let trackingOK: Bool
+            if case .normal = frame.camera.trackingState { trackingOK = true } else { trackingOK = false }
+
+            // Fuse only well-tracked frames: a frame placed with a bad pose smears the cloud.
+            if trackingOK, now - lastSweepSampleTime >= sweepSampleInterval, scanFrames.count < maxSweepFrames {
+                lastSweepSampleTime = now
+                let depthPts = FootDepthSampling.worldPointsNear(
+                    frame: frame,
+                    centerWorld: scanCenter,
+                    radiusMeters: scanRadiusMeters,
+                    pixelStride: 2,
+                    maxPoints: 8000
+                )
+                let frameIndex = scanFrames.count
+                let added = appendScanPoints(depthPts, frameIndex: UInt8(frameIndex))
+                scanFrames.append(ScanBundleMeta.Frame(
+                    index: frameIndex,
+                    pointCount: added,
+                    cameraTransform: ScanRecorder.flatten(frame.camera.transform),
+                    attitudeQuat: nil
+                ))
+                let left = max(0, Int((sweepDuration - elapsed).rounded(.up)))
+                statusLabel.text = "Move slowly around the foot — go low and round to the heel. \(left) s · \(scanAccumPoints.count) pts"
+            }
+
+            if sweepFinishRequested || elapsed >= sweepDuration
+                || scanFrames.count >= maxSweepFrames || scanAccumPoints.count >= maxScanPoints {
                 finishFootScan(frame: frame)
             }
         }
@@ -561,7 +593,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         t=\(String(format: "%.2f", now)) tracking=\(tracking)
         anchors mesh=\(meshAnchors) total=\(frame.anchors.count)
         blue mesh entities=\(meshAnchorEntities.count)
-        depth fuse: framesLeft=\(scanFramesRemaining) accumPts=\(scanAccumPoints.count) lastFused=\(lastDepthSampleCount)
+        depth fuse: sweeping=\(sweepActive) frames=\(scanFrames.count) accumPts=\(scanAccumPoints.count) lastFused=\(lastDepthSampleCount)
         mesh build err: \(lastMeshBuildError ?? "none")
         light=\(light) interrupted=\(sessionInterrupted)
         session err: \(lastSessionError ?? "none")

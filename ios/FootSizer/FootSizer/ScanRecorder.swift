@@ -19,7 +19,7 @@ struct ScanBundleMeta: Codable, Equatable {
         /// The constants the on-device engine ran with for this capture.
         static var current: Algorithm {
             Algorithm(
-                version: "1",
+                version: "2",
                 floorBandMm: FootMeasurementGeometry.floorBandMm,
                 legCapMm: FootMeasurementGeometry.legCapMm,
                 tipCorrectionMm: FootMeasurementGeometry.tipCorrectionMm
@@ -74,6 +74,8 @@ struct ScanBundleMeta: Codable, Equatable {
     var groundTruth: GroundTruth?
     var looksLikeFoot: Bool?
     var notes: String?
+    /// The engine saw toe → ankle only (leg in front of the heel); length is too short.
+    var heelHidden: Bool?
 }
 
 /// Saves every capture — accepted or rejected — as a replayable bundle under
