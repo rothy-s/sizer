@@ -381,6 +381,7 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
 
     @objc private func screenTapped(_ gr: UITapGestureRecognizer) {
         lastTapScreenPoint = gr.location(in: view)
+        statusLabel.textColor = .white
         statusLabel.text = "Tap Capture to fuse TrueDepth samples near this point."
     }
 
@@ -395,6 +396,7 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
         centerPixel = nil
         scanFramesRemaining = scanFrameCount
         captureButton.isEnabled = false
+        statusLabel.textColor = .white
         statusLabel.text = "Hold still — fusing TrueDepth depth (12 frames)…"
     }
 
@@ -471,17 +473,25 @@ final class TrueDepthFootScannerViewController: UIViewController, AVCaptureDepth
     private func finishScanError(_ message: String) {
         scanFramesRemaining = 0
         captureButton.isEnabled = true
-        onError?(message)
+        showProblem(message)
+    }
+
+    /// Recoverable problem: say it inside the scanner so the user can retry straight away.
+    /// (An alert on the parent screen only appears after the scanner is closed.)
+    private func showProblem(_ message: String) {
+        statusLabel.textColor = .systemYellow
+        statusLabel.text = message
     }
 
     private func finishScanSuccess() {
         captureButton.isEnabled = true
         guard let m = FootMeasurementGeometry.mondoBallFromReferenceHorizontalXY(scanAccumPoints) else {
             recordScanAndReset(measurement: nil, rejectReason: "no_lock_on")
-            onError?("Couldn't lock onto a single foot. Improve light, put the foot flat, fill the frame with one foot, and try again.")
+            showProblem("Couldn't lock onto a single foot. Improve light, put the foot flat, fill the frame with one foot, and try again.")
             return
         }
         recordScanAndReset(measurement: m, rejectReason: nil)
+        statusLabel.textColor = .white
         statusLabel.text = String(format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm", m.lengthMm, m.ballWidthMm, m.archHeightMm)
         onCaptured?(m)
     }

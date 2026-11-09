@@ -177,6 +177,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
 
     @objc private func screenTapped(_ gr: UITapGestureRecognizer) {
         lastTapScreenPoint = gr.location(in: arView)
+        statusLabel.textColor = .white
         statusLabel.text = "Tap Capture to sample mesh near this point."
     }
 
@@ -188,16 +189,18 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             return
         }
 
-        guard let ray = arView.ray(through: point) else {
-            onError?("Could not cast a ray through the tap point.")
-            return
+        // Prefer the scene mesh (cheap, already in world space). The mesh is often missing —
+        // ARKit has not built it yet, or the foot is too close to mesh — so fall back to a
+        // depth-backed ARKit raycast through the same screen point.
+        var hitPoint: SIMD3<Float>?
+        if let ray = arView.ray(through: point) {
+            hitPoint = closestMeshPoint(toRayOrigin: ray.origin, direction: simd_normalize(ray.direction))
         }
-
-        let worldOrigin = ray.origin
-        let worldDir = simd_normalize(ray.direction)
-
-        guard let hit = closestMeshPoint(toRayOrigin: worldOrigin, direction: worldDir) else {
-            onError?("No mesh hit. Aim at the foot and tap again.")
+        if hitPoint == nil {
+            hitPoint = depthRaycastPoint(at: point)
+        }
+        guard let hit = hitPoint else {
+            showProblem("Couldn't find a surface there. Move the phone slowly over the foot and floor for a second, then tap the foot and Capture again.")
             return
         }
 
@@ -210,7 +213,23 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         for e in meshAnchorEntities.values {
             e.isEnabled = false
         }
+        statusLabel.textColor = .white
         statusLabel.text = "Hold still — fusing LiDAR depth (10 frames)…"
+    }
+
+    /// World point under a screen point from ARKit's raycast (LiDAR depth backed), nearest first.
+    private func depthRaycastPoint(at point: CGPoint) -> SIMD3<Float>? {
+        guard let query = arView.makeRaycastQuery(from: point, allowing: .estimatedPlane, alignment: .any),
+              let first = arView.session.raycast(query).first else { return nil }
+        let t = first.worldTransform.columns.3
+        return SIMD3<Float>(t.x, t.y, t.z)
+    }
+
+    /// Recoverable problem: say it inside the scanner so the user can retry straight away.
+    /// (An alert on the parent screen only appears after the scanner is closed.)
+    private func showProblem(_ message: String) {
+        statusLabel.textColor = .systemYellow
+        statusLabel.text = message
     }
 
     private func quantKey(_ p: SIMD3<Float>) -> String {
@@ -332,7 +351,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         guard scanAccumPoints.count >= 80 else {
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "too_few_points")
             restoreDebugMeshes()
-            onError?("Not enough fused points (\(lastDepthSampleCount)). Move closer, hold still, improve light, and try again.")
+            showProblem("Not enough fused points (\(lastDepthSampleCount)). Move closer, hold still, improve light, and try again.")
             return
         }
 
@@ -344,7 +363,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             removeFootPointCloud()
             recordScanAndReset(frame: frame, seed: seed, result: nil, rejectReason: "no_lock_on")
             restoreDebugMeshes()
-            onError?("Couldn't lock onto a single foot (\(lastDepthSampleCount) pts). Put the foot flat on the floor, tap right on it, hold still, and try again.")
+            showProblem("Couldn't lock onto a single foot (\(lastDepthSampleCount) pts). Put the foot flat on the floor, tap right on it, hold still, and try again.")
             return
         }
 
@@ -352,6 +371,7 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         showFootPointCloud(points: result.isolatedPoints, cameraTransform: frame.camera.transform)
         recordScanAndReset(frame: frame, seed: seed, result: result, rejectReason: nil)
         let m = result.measurement
+        statusLabel.textColor = .white
         statusLabel.text = String(
             format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
             m.lengthMm, m.ballWidthMm, m.archHeightMm, result.isolatedPoints.count
