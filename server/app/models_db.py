@@ -20,15 +20,19 @@ class FootMeasurementRecord(Base):
 
     left_length_mm: Mapped[float] = mapped_column(Float)
     left_width_mm: Mapped[float] = mapped_column(Float)
+    left_arch_mm: Mapped[float] = mapped_column(Float, default=0.0)
     left_mondo_mm: Mapped[int] = mapped_column(Integer)
     left_us_approx: Mapped[float] = mapped_column(Float)
     left_width_code: Mapped[str] = mapped_column(String(32))
+    left_arch_class: Mapped[str] = mapped_column(String(16), default="medium")
 
     right_length_mm: Mapped[float] = mapped_column(Float)
     right_width_mm: Mapped[float] = mapped_column(Float)
+    right_arch_mm: Mapped[float] = mapped_column(Float, default=0.0)
     right_mondo_mm: Mapped[int] = mapped_column(Integer)
     right_us_approx: Mapped[float] = mapped_column(Float)
     right_width_code: Mapped[str] = mapped_column(String(32))
+    right_arch_class: Mapped[str] = mapped_column(String(16), default="medium")
 
 
 class ShoeModelRecord(Base):

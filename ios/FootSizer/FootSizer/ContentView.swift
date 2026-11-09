@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var right: FootSideMeasurement?
     @State private var showLeftScan = false
     @State private var showRightScan = false
+    @State private var showLeftTrueDepth = false
+    @State private var showRightTrueDepth = false
     @State private var manualLeftLength = ""
     @State private var manualLeftWidth = ""
     @State private var manualRightLength = ""
@@ -45,6 +47,9 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Button("Scan with LiDAR") { showLeftScan = true }
+                    if FootScanCapabilities.supportsTrueDepthDepthDelivery {
+                        Button("Scan with TrueDepth (front)") { showLeftTrueDepth = true }
+                    }
                     HStack {
                         TextField("Length mm", text: $manualLeftLength)
                             .keyboardType(.numberPad)
@@ -64,6 +69,9 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Button("Scan with LiDAR") { showRightScan = true }
+                    if FootScanCapabilities.supportsTrueDepthDepthDelivery {
+                        Button("Scan with TrueDepth (front)") { showRightTrueDepth = true }
+                    }
                     HStack {
                         TextField("Length mm", text: $manualRightLength)
                             .keyboardType(.numberPad)
@@ -72,6 +80,17 @@ struct ContentView: View {
                     }
                     Button("Use manual right values") {
                         applyManualRight()
+                    }
+                }
+
+                if let l = left, let r = right {
+                    Section {
+                        NavigationLink {
+                            FootResultsView(gender: gender, left: l, right: r)
+                        } label: {
+                            Label("See measurements & sizes", systemImage: "ruler")
+                                .font(.headline)
+                        }
                     }
                 }
 
@@ -84,6 +103,8 @@ struct ContentView: View {
                         }
                     }
                     .disabled(!canSubmit || isSubmitting)
+                } footer: {
+                    Text("Optional — saves to the server and returns shoe suggestions. The size breakdown above works offline.")
                 }
 
                 if let m = measurementResult {
@@ -130,6 +151,20 @@ struct ContentView: View {
                     onCaptured: { right = $0 },
                     onError: { alertMessage = $0 },
                     onDismiss: { showRightScan = false }
+                )
+            }
+            .sheet(isPresented: $showLeftTrueDepth) {
+                TrueDepthFootScannerSheet(
+                    onCaptured: { left = $0 },
+                    onError: { alertMessage = $0 },
+                    onDismiss: { showLeftTrueDepth = false }
+                )
+            }
+            .sheet(isPresented: $showRightTrueDepth) {
+                TrueDepthFootScannerSheet(
+                    onCaptured: { right = $0 },
+                    onError: { alertMessage = $0 },
+                    onDismiss: { showRightTrueDepth = false }
                 )
             }
             .alert("Notice", isPresented: Binding(

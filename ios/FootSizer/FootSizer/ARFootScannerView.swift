@@ -1,30 +1,60 @@
 import ARKit
 import RealityKit
 import SwiftUI
+import UIKit
 import simd
 
-/// LiDAR scene mesh capture: tap on a foot; we cluster mesh vertices near the hit and
-/// derive **foot length** (heel–toe, longer horizontal span) and **ball width** (shorter span)
-/// in millimeters — aligned with Mondopoint length + forefoot width used for fitting.
+/// LiDAR capture: tap on a foot, then **Capture**. We accumulate **dense scene-depth samples**
+/// (plus nearby mesh vertices) in a sphere around the tap — much higher resolution than
+/// `ARMeshAnchor` alone — then derive **foot length** and **ball width** (mm) from a horizontal AABB.
 final class FootScanARViewController: UIViewController, ARSessionDelegate {
     var onCaptured: ((FootSideMeasurement) -> Void)?
     var onError: ((String) -> Void)?
 
     private var arView: ARView!
     private var statusLabel: UILabel!
+    private var trackingWarningLabel: UILabel!
     private var captureButton: UIButton!
     private var debugTextView: UITextView!
 
     private var lastDebugTextUpdate: TimeInterval = 0
-    private var meshOverlayReapplyCount = 0
+    private var lastMeshSyncTime: TimeInterval = 0
     private var sessionInterrupted = false
     private var lastSessionError: String?
+    private var lastMeshBuildError: String?
+    private var lastDepthSampleCount: Int = 0
+
+    /// RealityKit entities for scene mesh (bright blue); keyed by `ARMeshAnchor.identifier`.
+    private var meshAnchorEntities = [UUID: AnchorEntity]()
+
+    /// High-res depth accumulation (0 = idle).
+    private var scanFramesRemaining: Int = 0
+    private var scanCenter: SIMD3<Float> = .zero
+    private var scanAccumPoints: [SIMD3<Float>] = []
+    private var scanVoxelKeys: Set<String> = []
+    private let maxScanPoints = 40_000
+    private var footPointCloudAnchor: AnchorEntity?
+
+    /// Unlit so the mesh stays visible in AR (lit `SimpleMaterial` can look black with no scene lights).
+    private static func sceneMeshMaterial() -> RealityKit.Material {
+        var mat = UnlitMaterial()
+        mat.color = .init(
+            tint: UIColor(red: 0.12, green: 0.55, blue: 1.0, alpha: 0.55),
+            texture: nil
+        )
+        if #available(iOS 18.0, *) {
+            mat.faceCulling = .none
+        }
+        return mat
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
 
-        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) else {
+        let supportsMesh = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
+            || ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification)
+        guard supportsMesh else {
             onError?("This device does not support LiDAR scene mesh. Use a Pro model iPhone/iPad or enter measurements manually.")
             return
         }
@@ -41,27 +71,52 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         ])
 
         let config = ARWorldTrackingConfiguration()
-        config.sceneReconstruction = .mesh
-        config.environmentTexturing = .automatic
+        // ARKit does not expose a “finer mesh” LOD; reconstruction detail is OS-defined.
+        // Prefer classified mesh when available (same underlying density, adds face labels).
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            config.sceneReconstruction = .meshWithClassification
+        } else {
+            config.sceneReconstruction = .mesh
+        }
+        // Skip HDR environment maps — reduces GPU work; not needed for foot mesh capture.
+        config.environmentTexturing = .none
+        // RealityKit scene graph updates must run on the main queue; default delegate queue is background.
+        arView.session.delegateQueue = DispatchQueue.main
         arView.session.run(config)
-
-        ensureMeshDebugOverlay()
+        // Always show Apple’s scene mesh wireframe as fallback; custom blue mesh draws on top when it succeeds.
+        arView.debugOptions.insert(.showSceneUnderstanding)
 
         statusLabel = UILabel()
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.textColor = .white
         statusLabel.numberOfLines = 0
         statusLabel.font = .preferredFont(forTextStyle: .footnote)
-        statusLabel.text = "You should see the 3D mesh overlay on surfaces. Point at your feet, tap a foot, then Capture."
+        statusLabel.text = "Scan the floor slowly first. Point at a foot, tap where it sits, then Capture — we fuse many LiDAR depth frames for a dense green point cloud."
         view.addSubview(statusLabel)
+
+        trackingWarningLabel = UILabel()
+        trackingWarningLabel.translatesAutoresizingMaskIntoConstraints = false
+        trackingWarningLabel.numberOfLines = 0
+        trackingWarningLabel.font = .preferredFont(forTextStyle: .caption1)
+        trackingWarningLabel.textColor = .white
+        trackingWarningLabel.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.92)
+        trackingWarningLabel.layer.cornerRadius = 8
+        trackingWarningLabel.layer.masksToBounds = true
+        trackingWarningLabel.isHidden = true
+        trackingWarningLabel.textAlignment = .center
+        view.addSubview(trackingWarningLabel)
+
         NSLayoutConstraint.activate([
             statusLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             statusLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            trackingWarningLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            trackingWarningLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            trackingWarningLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
         ])
 
         captureButton = UIButton(type: .system)
-        captureButton.setTitle("Capture foot region", for: .normal)
+        captureButton.setTitle("Capture (high-res depth)", for: .normal)
         captureButton.titleLabel?.font = .boldSystemFont(ofSize: 17)
         captureButton.backgroundColor = UIColor.systemBlue
         captureButton.setTitleColor(.white, for: .normal)
@@ -97,14 +152,6 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         arView.addGestureRecognizer(tap)
     }
 
-    /// RealityKit can clear `debugOptions` when the session reconfigures; re-applying fixes “mesh vanished”.
-    private func ensureMeshDebugOverlay() {
-        if !arView.debugOptions.contains(.showSceneUnderstanding) {
-            arView.debugOptions.insert(.showSceneUnderstanding)
-            meshOverlayReapplyCount += 1
-        }
-    }
-
     private func appendDebugLine(_ line: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -125,6 +172,8 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
     }
 
     @objc private func captureTapped() {
+        guard scanFramesRemaining == 0 else { return }
+
         guard let point = lastTapScreenPoint else {
             statusLabel.text = "Tap on the foot in the AR view first."
             return
@@ -143,53 +192,260 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             return
         }
 
-        let center = hit
-        let radius: Float = 0.2
-        var worldVertices: [SIMD3<Float>] = []
-        worldVertices.reserveCapacity(4096)
+        scanCenter = hit
+        scanAccumPoints.removeAll(keepingCapacity: false)
+        scanVoxelKeys.removeAll(keepingCapacity: false)
+        scanFramesRemaining = 10
+        lastDepthSampleCount = 0
+        captureButton.isEnabled = false
+        arView.debugOptions.remove(.showSceneUnderstanding)
+        for e in meshAnchorEntities.values {
+            e.isEnabled = false
+        }
+        statusLabel.text = "Hold still — fusing LiDAR depth (10 frames)…"
+    }
 
-        for anchor in arView.session.currentFrame?.anchors ?? [] {
+    private func quantKey(_ p: SIMD3<Float>) -> String {
+        "\(Int(p.x * 250))_\(Int(p.y * 250))_\(Int(p.z * 250))"
+    }
+
+    private func appendScanPoints(_ pts: [SIMD3<Float>]) {
+        for p in pts {
+            let k = quantKey(p)
+            if scanVoxelKeys.insert(k).inserted {
+                scanAccumPoints.append(p)
+                if scanAccumPoints.count >= maxScanPoints { return }
+            }
+        }
+    }
+
+    private func restoreDebugMeshes() {
+        arView.debugOptions.insert(.showSceneUnderstanding)
+        for e in meshAnchorEntities.values {
+            e.isEnabled = true
+        }
+    }
+
+    private func removeFootPointCloud() {
+        if let a = footPointCloudAnchor {
+            arView.scene.removeAnchor(a)
+            footPointCloudAnchor = nil
+        }
+    }
+
+    private func showFootPointCloud(points: [SIMD3<Float>], cameraTransform: simd_float4x4) {
+        removeFootPointCloud()
+        do {
+            let mesh = try FootDepthSampling.meshResource(
+                from: points,
+                cameraTransform: cameraTransform,
+                quadHalfMeters: 0.0025
+            )
+            let model = ModelEntity(mesh: mesh, materials: [FootDepthSampling.pointCloudMaterial()])
+            let anchor = AnchorEntity(world: .zero)
+            anchor.addChild(model)
+            arView.scene.addAnchor(anchor)
+            footPointCloudAnchor = anchor
+        } catch {
+            // Visualization is optional; sizing still uses the same point set.
+        }
+    }
+
+    private func finishFootScan(frame: ARFrame) {
+        captureButton.isEnabled = true
+
+        for anchor in frame.anchors {
             guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
             let verts = meshVertexWorldPositions(anchor: meshAnchor)
-            for v in verts where simd_distance(v, center) <= radius {
-                worldVertices.append(v)
+            for v in verts where simd_distance(v, scanCenter) <= 0.22 {
+                appendScanPoints([v])
             }
         }
 
-        guard worldVertices.count >= 80 else {
-            onError?("Not enough mesh near the tap (\(worldVertices.count) pts). Move closer, improve lighting, and try again.")
+        lastDepthSampleCount = scanAccumPoints.count
+
+        guard scanAccumPoints.count >= 80 else {
+            scanAccumPoints.removeAll(keepingCapacity: false)
+            scanVoxelKeys.removeAll(keepingCapacity: false)
+            restoreDebugMeshes()
+            onError?("Not enough fused points (\(lastDepthSampleCount)). Move closer, hold still, improve light, and try again.")
             return
         }
 
-        let xs = worldVertices.map(\.x)
-        let zs = worldVertices.map(\.z)
-        guard let minX = xs.min(), let maxX = xs.max(), let minZ = zs.min(), let maxZ = zs.max() else {
-            onError?("Could not compute bounds.")
+        // Isolate + measure the foot the user tapped (seed = tap in world X/Z). The engine
+        // strips the floor, drops the leg, and keeps the connected foot cluster.
+        let seed = SIMD2<Float>(scanCenter.x, scanCenter.z)
+        guard let result = FootMeasurementGeometry.measure(
+            points: scanAccumPoints, verticalAxis: 1, seed: seed
+        ) else {
+            removeFootPointCloud()
+            scanAccumPoints.removeAll(keepingCapacity: false)
+            scanVoxelKeys.removeAll(keepingCapacity: false)
+            restoreDebugMeshes()
+            onError?("Couldn't lock onto a single foot (\(lastDepthSampleCount) pts). Put the foot flat on the floor, tap right on it, hold still, and try again.")
             return
         }
 
-        let dx = Double(maxX - minX) * 1000.0
-        let dz = Double(maxZ - minZ) * 1000.0
-        let lengthMm = max(dx, dz)
-        let widthMm = min(dx, dz)
+        // Show ONLY the locked-on foot cluster (green) — visual confirmation of the lock.
+        showFootPointCloud(points: result.isolatedPoints, cameraTransform: frame.camera.transform)
+        scanAccumPoints.removeAll(keepingCapacity: false)
+        scanVoxelKeys.removeAll(keepingCapacity: false)
+        let m = result.measurement
+        statusLabel.text = String(
+            format: "Locked on ✓  %.0f × %.0f mm · arch %.0f mm (%d pts)",
+            m.lengthMm, m.ballWidthMm, m.archHeightMm, result.isolatedPoints.count
+        )
+        onCaptured?(m)
+    }
 
-        guard lengthMm > 80, lengthMm < 400, widthMm > 30, widthMm < 200 else {
-            onError?("Unrealistic dimensions (\(Int(lengthMm)) × \(Int(widthMm)) mm). Tap closer to a single foot.")
-            return
+    /// Custom blue mesh visualization (drawn in addition to `.showSceneUnderstanding` wireframe).
+    private func upsertBlueMeshEntity(for meshAnchor: ARMeshAnchor) {
+        do {
+            let meshResource = try Self.meshResource(from: meshAnchor.geometry)
+            let mat = Self.sceneMeshMaterial()
+            lastMeshBuildError = nil
+            if let existing = meshAnchorEntities[meshAnchor.identifier],
+               let modelEntity = existing.children.first as? ModelEntity {
+                modelEntity.model = ModelComponent(mesh: meshResource, materials: [mat])
+            } else {
+                let modelEntity = ModelEntity(mesh: meshResource, materials: [mat])
+                let anchorEntity = AnchorEntity(anchor: meshAnchor)
+                anchorEntity.addChild(modelEntity)
+                arView.scene.addAnchor(anchorEntity)
+                meshAnchorEntities[meshAnchor.identifier] = anchorEntity
+            }
+        } catch {
+            lastMeshBuildError = String(describing: error)
         }
+    }
 
-        let measurement = FootSideMeasurement(lengthMm: lengthMm, ballWidthMm: widthMm)
-        onCaptured?(measurement)
+    /// Builds a `MeshResource` from ARKit geometry (no `MeshResource.generate(from: ARMeshGeometry)` on all SDKs).
+    private static func meshResource(from geometry: ARMeshGeometry) throws -> MeshResource {
+        do {
+            return try meshResource(from: geometry, includeNormals: true)
+        } catch {
+            return try meshResource(from: geometry, includeNormals: false)
+        }
+    }
+
+    private static func meshResource(from geometry: ARMeshGeometry, includeNormals: Bool) throws -> MeshResource {
+        let positions = readSIMD3Array(from: geometry.vertices)
+        let indices = readTriangleIndices(from: geometry.faces)
+        guard !positions.isEmpty, !indices.isEmpty, indices.count % 3 == 0 else {
+            throw MeshBuildError.invalidBuffers
+        }
+        var descriptor = MeshDescriptor(name: "sceneMesh")
+        descriptor.positions = MeshBuffers.Positions(positions)
+        descriptor.primitives = .triangles(indices)
+        if includeNormals {
+            let normalsSource = geometry.normals
+            if normalsSource.count > 0, normalsSource.count == positions.count {
+                descriptor.normals = MeshBuffers.Normals(readSIMD3Array(from: normalsSource))
+            }
+        }
+        return try MeshResource.generate(from: [descriptor])
+    }
+
+    private enum MeshBuildError: Error {
+        case invalidBuffers
+    }
+
+    private static func readSIMD3Array(from source: ARGeometrySource) -> [SIMD3<Float>] {
+        let count = source.count
+        let stride = source.stride
+        let offset = source.offset
+        let base = source.buffer.contents()
+        var out: [SIMD3<Float>] = []
+        out.reserveCapacity(count)
+        for i in 0..<count {
+            let byteOffset = offset + stride * i
+            let v = base.advanced(by: byteOffset).assumingMemoryBound(to: SIMD3<Float>.self).pointee
+            out.append(v)
+        }
+        return out
+    }
+
+    /// `ARGeometryElement.count` is the number of **primitives** (triangles), not raw index count.
+    /// Prefer the subscript API (no `offset` / manual index buffer walk — `offset` was removed from this type).
+    private static func readTriangleIndices(from faces: ARGeometryElement) -> [UInt32] {
+        let primitiveCount = faces.count
+        let indicesPerPrimitive = faces.indexCountPerPrimitive
+        var indices: [UInt32] = []
+        indices.reserveCapacity(primitiveCount * indicesPerPrimitive)
+        for p in 0..<primitiveCount {
+            // Subscript returns integer indices; may be UInt16 when `bytesPerIndex == 2`.
+            for idx in faces[p] {
+                indices.append(UInt32(idx))
+            }
+        }
+        return indices
+    }
+
+    private func removeMeshEntity(for meshAnchor: ARMeshAnchor) {
+        if let entity = meshAnchorEntities.removeValue(forKey: meshAnchor.identifier) {
+            arView.scene.removeAnchor(entity)
+        }
     }
 
     // MARK: - ARSessionDelegate
 
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        for anchor in anchors {
+            guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
+            upsertBlueMeshEntity(for: meshAnchor)
+        }
+    }
+
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        for anchor in anchors {
+            guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
+            upsertBlueMeshEntity(for: meshAnchor)
+        }
+    }
+
+    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        for anchor in anchors {
+            guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
+            removeMeshEntity(for: meshAnchor)
+        }
+    }
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let now = frame.timestamp
+
+        // Mesh anchors don’t always arrive via `didAdd` before we care; re-sync from the frame periodically.
+        if now - lastMeshSyncTime >= 0.2 {
+            lastMeshSyncTime = now
+            for anchor in frame.anchors {
+                if let meshAnchor = anchor as? ARMeshAnchor {
+                    upsertBlueMeshEntity(for: meshAnchor)
+                }
+            }
+        }
+
+        if scanFramesRemaining > 0 {
+            let depthPts = FootDepthSampling.worldPointsNear(
+                frame: frame,
+                centerWorld: scanCenter,
+                radiusMeters: 0.22,
+                pixelStride: 2,
+                maxPoints: 8000
+            )
+            appendScanPoints(depthPts)
+            scanFramesRemaining -= 1
+            if scanFramesRemaining == 0 {
+                finishFootScan(frame: frame)
+            }
+        }
+
         if now - lastDebugTextUpdate < 0.25 { return }
         lastDebugTextUpdate = now
 
-        ensureMeshDebugOverlay()
+        if !arView.debugOptions.contains(.showSceneUnderstanding) {
+            arView.debugOptions.insert(.showSceneUnderstanding)
+        }
+
+        updateTrackingBanner(state: frame.camera.trackingState)
 
         let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }.count
         let tracking = describeTracking(frame.camera.trackingState)
@@ -197,17 +453,23 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
             String(format: "%.0f lx", est.ambientIntensity)
         } ?? "n/a"
 
-        let overlayOn = arView.debugOptions.contains(.showSceneUnderstanding)
         let lines = """
         t=\(String(format: "%.2f", now)) tracking=\(tracking)
         anchors mesh=\(meshAnchors) total=\(frame.anchors.count)
-        mesh overlay flag=\(overlayOn) reapplies=\(meshOverlayReapplyCount)
+        blue mesh entities=\(meshAnchorEntities.count)
+        depth fuse: framesLeft=\(scanFramesRemaining) accumPts=\(scanAccumPoints.count) lastFused=\(lastDepthSampleCount)
+        mesh build err: \(lastMeshBuildError ?? "none")
         light=\(light) interrupted=\(sessionInterrupted)
         session err: \(lastSessionError ?? "none")
+        slam_note: internal VIO may log "poor slam" — often harmless; see orange banner if tracking dips.
         """
         DispatchQueue.main.async { [weak self] in
             self?.debugTextView.text = lines
         }
+    }
+
+    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+        updateTrackingBanner(state: camera.trackingState)
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
@@ -221,12 +483,44 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         if let config = session.configuration {
             session.run(config, options: [])
         }
-        ensureMeshDebugOverlay()
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         lastSessionError = error.localizedDescription
         appendDebugLine("didFailWithError: \(error.localizedDescription)")
+    }
+
+    private func updateTrackingBanner(state: ARCamera.TrackingState) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            switch state {
+            case .normal:
+                self.trackingWarningLabel.isHidden = true
+            case .notAvailable:
+                self.trackingWarningLabel.isHidden = false
+                self.trackingWarningLabel.text = "AR tracking unavailable. Add light and aim at textured surfaces."
+            case .limited(let reason):
+                self.trackingWarningLabel.isHidden = false
+                self.trackingWarningLabel.text = self.trackingTip(for: reason)
+            @unknown default:
+                self.trackingWarningLabel.isHidden = true
+            }
+        }
+    }
+
+    private func trackingTip(for reason: ARCamera.TrackingState.Reason) -> String {
+        switch reason {
+        case .excessiveMotion:
+            return "Tracking limited (motion): move slowly — fast motion hurts SLAM and mesh updates."
+        case .insufficientFeatures:
+            return "Tracking limited (visual features): show carpet, grout lines, or clutter — plain floors are hard for AR."
+        case .initializing:
+            return "AR still initializing — pan the room slowly until this clears."
+        case .relocalizing:
+            return "Relocalizing map — revisit the same area or walk slowly to recover tracking."
+        @unknown default:
+            return "Tracking limited — improve lighting and move slowly."
+        }
     }
 
     private func describeTracking(_ state: ARCamera.TrackingState) -> String {
@@ -256,8 +550,8 @@ final class FootScanARViewController: UIViewController, ARSessionDelegate {
         for anchor in arView.session.currentFrame?.anchors ?? [] {
             guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
             let verts = meshVertexWorldPositions(anchor: meshAnchor)
-            for i in stride(from: 0, to: verts.count, by: 2) {
-                let v = verts[i]
+            // Use every vertex (no subsampling) so ray–mesh matching uses full ARKit detail.
+            for v in verts {
                 let t = simd_dot(v - origin, dir)
                 guard t > 0.08, t < 4.0 else { continue }
                 let proj = origin + dir * t
@@ -301,7 +595,10 @@ struct ARFootScannerSheet: UIViewControllerRepresentable {
         let c = FootScanARViewController()
         c.onCaptured = { m in
             onCaptured(m)
-            onDismiss()
+            // Brief delay so the dense green point cloud is visible before the sheet dismisses.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
+                onDismiss()
+            }
         }
         c.onError = { msg in
             onError(msg)

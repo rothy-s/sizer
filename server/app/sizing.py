@@ -119,22 +119,64 @@ def width_code(foot_length_mm: float, ball_width_mm: float, gender: Gender) -> W
     return WidthCode.standard
 
 
+# --- Arch height (dorsal instep proxy) ---------------------------------------
+
+
+class ArchClass(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
+def arch_class(instep_mm: float, foot_length_mm: float) -> ArchClass:
+    """Dorsal instep height relative to foot length -> low / medium / high.
+    Mirrors the iOS `SizeConversion.archClass`. Typical ratios cluster ~0.22-0.28."""
+    if foot_length_mm <= 0 or instep_mm <= 0:
+        return ArchClass.medium
+    r = instep_mm / foot_length_mm
+    if r < 0.225:
+        return ArchClass.low
+    if r > 0.275:
+        return ArchClass.high
+    return ArchClass.medium
+
+
+# --- Multi-country size conversion (mirrors iOS SizeConversion) ---------------
+
+LAST_ALLOWANCE_MM = 16.9  # 2/3 inch last allowance (Barleycorn)
+
+
+def convert_sizes(foot_length_mm: float, gender: Gender) -> dict[str, float | int]:
+    """Approximate US/UK/EU/CM plus Mondopoint from foot length. US anchors on the
+    interpolation tables above; the rest use standard footwear formulas."""
+    us = round(approximate_us_size(foot_length_mm, gender), 1)
+    uk = round(us - (1 if gender is Gender.mens else 2), 1)
+    eu = round(1.5 * (foot_length_mm + LAST_ALLOWANCE_MM) / 10.0, 1)
+    cm = round(foot_length_mm / 10.0, 1)
+    return {"us": us, "uk": uk, "eu": eu, "cm": cm, "mondo": mondopoint_size(foot_length_mm)}
+
+
 @dataclass(frozen=True)
 class FootSizingResult:
     mondopoint_mm: int
     us_size_approx: float
     width_code: WidthCode
+    arch_class: ArchClass
+    sizes: dict[str, float | int]
 
 
 def compute_foot_sizing(
     foot_length_mm: float,
     ball_width_mm: float,
     gender: Gender,
+    instep_mm: float = 0.0,
 ) -> FootSizingResult:
     return FootSizingResult(
         mondopoint_mm=mondopoint_size(foot_length_mm),
         us_size_approx=round(approximate_us_size(foot_length_mm, gender), 1),
         width_code=width_code(foot_length_mm, ball_width_mm, gender),
+        arch_class=arch_class(instep_mm, foot_length_mm),
+        sizes=convert_sizes(foot_length_mm, gender),
     )
 
 
