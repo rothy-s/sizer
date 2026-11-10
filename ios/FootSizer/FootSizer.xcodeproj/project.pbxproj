@@ -17,6 +17,12 @@
 		A10000000000000000000008 /* ARKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* ARKit.framework */; };
 		A10000000000000000000009 /* RealityKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* RealityKit.framework */; };
 		A10000000000000000000010 /* FootSizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* FootSizerTests.swift */; };
+		A10000000000000000000011 /* FootDepthSampling.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* FootDepthSampling.swift */; };
+		A10000000000000000000012 /* FootMeasurementGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* FootMeasurementGeometry.swift */; };
+		A10000000000000000000020 /* ScanRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000020 /* ScanRecorder.swift */; };
+		A10000000000000000000014 /* SizeConversion.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* SizeConversion.swift */; };
+		A10000000000000000000015 /* FootResultsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000016 /* FootResultsView.swift */; };
+		A10000000000000000000013 /* TrueDepthFootScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* TrueDepthFootScannerView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -31,6 +37,12 @@
 		B10000000000000000000009 /* ARKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ARKit.framework; path = System/Library/Frameworks/ARKit.framework; sourceTree = SDKROOT; };
 		B10000000000000000000010 /* RealityKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = RealityKit.framework; path = System/Library/Frameworks/RealityKit.framework; sourceTree = SDKROOT; };
 		B10000000000000000000011 /* FootSizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootSizerTests.swift; sourceTree = "<group>"; };
+		B10000000000000000000012 /* FootDepthSampling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootDepthSampling.swift; sourceTree = "<group>"; };
+		B10000000000000000000013 /* FootMeasurementGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootMeasurementGeometry.swift; sourceTree = "<group>"; };
+		B10000000000000000000020 /* ScanRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanRecorder.swift; sourceTree = "<group>"; };
+		B10000000000000000000015 /* SizeConversion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SizeConversion.swift; sourceTree = "<group>"; };
+		B10000000000000000000016 /* FootResultsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FootResultsView.swift; sourceTree = "<group>"; };
+		B10000000000000000000014 /* TrueDepthFootScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrueDepthFootScannerView.swift; sourceTree = "<group>"; };
 		C10000000000000000000001 /* FootSizer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FootSizer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C10000000000000000000002 /* FootSizerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FootSizerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -94,6 +106,12 @@
 				B10000000000000000000004 /* FootScanModels.swift */,
 				B10000000000000000000005 /* FootSizingLocal.swift */,
 				B10000000000000000000006 /* APIClient.swift */,
+				B10000000000000000000012 /* FootDepthSampling.swift */,
+				B10000000000000000000013 /* FootMeasurementGeometry.swift */,
+				B10000000000000000000020 /* ScanRecorder.swift */,
+				B10000000000000000000015 /* SizeConversion.swift */,
+				B10000000000000000000016 /* FootResultsView.swift */,
+				B10000000000000000000014 /* TrueDepthFootScannerView.swift */,
 				B10000000000000000000007 /* Assets.xcassets */,
 				B10000000000000000000008 /* Info.plist */,
 			);
@@ -210,6 +228,12 @@
 				A10000000000000000000004 /* FootScanModels.swift in Sources */,
 				A10000000000000000000005 /* FootSizingLocal.swift in Sources */,
 				A10000000000000000000006 /* APIClient.swift in Sources */,
+				A10000000000000000000011 /* FootDepthSampling.swift in Sources */,
+				A10000000000000000000012 /* FootMeasurementGeometry.swift in Sources */,
+				A10000000000000000000020 /* ScanRecorder.swift in Sources */,
+				A10000000000000000000014 /* SizeConversion.swift in Sources */,
+				A10000000000000000000015 /* FootResultsView.swift in Sources */,
+				A10000000000000000000013 /* TrueDepthFootScannerView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

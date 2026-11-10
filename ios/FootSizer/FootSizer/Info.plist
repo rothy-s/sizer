@@ -21,7 +21,11 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>FootSizer uses the camera and LiDAR to capture a 3D mesh of your feet for length and width measurements.</string>
+	<string>FootSizer uses the back camera with LiDAR and the front TrueDepth camera to capture depth of your feet for length and width measurements.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

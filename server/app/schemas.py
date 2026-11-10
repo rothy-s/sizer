@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class FootSideIn(BaseModel):
     length_mm: float = Field(..., gt=0, description="Heel to longest toe (Mondopoint length axis), mm")
     ball_width_mm: float = Field(..., gt=0, description="Widest forefoot (ball) width, mm")
+    arch_height_mm: float = Field(0.0, ge=0, description="Dorsal instep height (arch proxy), mm; 0 if unknown")
 
 
 class MeasurementCreate(BaseModel):
@@ -21,9 +22,13 @@ class MeasurementOut(BaseModel):
     left_mondo_mm: int
     left_us_approx: float
     left_width_code: str
+    left_arch_class: str
+    left_sizes: dict[str, float]
     right_mondo_mm: int
     right_us_approx: float
     right_width_code: str
+    right_arch_class: str
+    right_sizes: dict[str, float]
 
 
 class ShoeRecommendation(BaseModel):

@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var right: FootSideMeasurement?
     @State private var showLeftScan = false
     @State private var showRightScan = false
+    @State private var showLeftTrueDepth = false
+    @State private var showRightTrueDepth = false
     @State private var manualLeftLength = ""
     @State private var manualLeftWidth = ""
     @State private var manualRightLength = ""
@@ -15,6 +17,8 @@ struct ContentView: View {
     @State private var alertMessage: String?
     @State private var measurementResult: MeasurementResponse?
     @State private var recommendations: [ShoeRecommendation] = []
+    @State private var recordedScanCount = 0
+    @State private var confirmDeleteScans = false
 
     var body: some View {
         NavigationStack {
@@ -45,6 +49,9 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Button("Scan with LiDAR") { showLeftScan = true }
+                    if FootScanCapabilities.supportsTrueDepthDepthDelivery {
+                        Button("Scan with TrueDepth (front)") { showLeftTrueDepth = true }
+                    }
                     HStack {
                         TextField("Length mm", text: $manualLeftLength)
                             .keyboardType(.numberPad)
@@ -64,6 +71,9 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Button("Scan with LiDAR") { showRightScan = true }
+                    if FootScanCapabilities.supportsTrueDepthDepthDelivery {
+                        Button("Scan with TrueDepth (front)") { showRightTrueDepth = true }
+                    }
                     HStack {
                         TextField("Length mm", text: $manualRightLength)
                             .keyboardType(.numberPad)
@@ -72,6 +82,17 @@ struct ContentView: View {
                     }
                     Button("Use manual right values") {
                         applyManualRight()
+                    }
+                }
+
+                if let l = left, let r = right {
+                    Section {
+                        NavigationLink {
+                            FootResultsView(gender: gender, left: l, right: r)
+                        } label: {
+                            Label("See measurements & sizes", systemImage: "ruler")
+                                .font(.headline)
+                        }
                     }
                 }
 
@@ -84,6 +105,22 @@ struct ContentView: View {
                         }
                     }
                     .disabled(!canSubmit || isSubmitting)
+                } footer: {
+                    Text("Optional — saves to the server and returns shoe suggestions. The size breakdown above works offline.")
+                }
+
+                Section {
+                    LabeledContent("Recorded scans", value: "\(recordedScanCount)")
+                    if recordedScanCount > 0 {
+                        ShareLink("Export all scans", item: ScanRecorder.scansDirectory)
+                        Button("Delete all recorded scans", role: .destructive) {
+                            confirmDeleteScans = true
+                        }
+                    }
+                } header: {
+                    Text("Scan recordings")
+                } footer: {
+                    Text("Every capture, including rejected ones, is saved on this device so it can be replayed offline. Also in Files → On My iPhone → FootSizer → Scans.")
                 }
 
                 if let m = measurementResult {
@@ -120,17 +157,51 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showLeftScan) {
                 ARFootScannerSheet(
+                    side: "left",
                     onCaptured: { left = $0 },
                     onError: { alertMessage = $0 },
-                    onDismiss: { showLeftScan = false }
+                    onDismiss: { showLeftScan = false },
+                    onScanRecorded: refreshRecordedScanCount
                 )
             }
             .sheet(isPresented: $showRightScan) {
                 ARFootScannerSheet(
+                    side: "right",
                     onCaptured: { right = $0 },
                     onError: { alertMessage = $0 },
-                    onDismiss: { showRightScan = false }
+                    onDismiss: { showRightScan = false },
+                    onScanRecorded: refreshRecordedScanCount
                 )
+            }
+            .sheet(isPresented: $showLeftTrueDepth) {
+                TrueDepthFootScannerSheet(
+                    side: "left",
+                    onCaptured: { left = $0 },
+                    onError: { alertMessage = $0 },
+                    onDismiss: { showLeftTrueDepth = false },
+                    onScanRecorded: refreshRecordedScanCount
+                )
+            }
+            .sheet(isPresented: $showRightTrueDepth) {
+                TrueDepthFootScannerSheet(
+                    side: "right",
+                    onCaptured: { right = $0 },
+                    onError: { alertMessage = $0 },
+                    onDismiss: { showRightTrueDepth = false },
+                    onScanRecorded: refreshRecordedScanCount
+                )
+            }
+            .onAppear(perform: refreshRecordedScanCount)
+            .confirmationDialog(
+                "Delete all \(recordedScanCount) recorded scans from this device?",
+                isPresented: $confirmDeleteScans,
+                titleVisibility: .visible
+            ) {
+                Button("Delete all", role: .destructive) {
+                    ScanRecorder.deleteAll()
+                    refreshRecordedScanCount()
+                }
+                Button("Cancel", role: .cancel) {}
             }
             .alert("Notice", isPresented: Binding(
                 get: { alertMessage != nil },
@@ -141,6 +212,10 @@ struct ContentView: View {
                 Text(alertMessage ?? "")
             }
         }
+    }
+
+    private func refreshRecordedScanCount() {
+        recordedScanCount = ScanRecorder.bundleDirectories().count
     }
 
     private var canSubmit: Bool {

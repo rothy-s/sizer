@@ -17,6 +17,9 @@ enum ShoeGender: String, CaseIterable, Identifiable {
 struct FootSideMeasurement: Codable, Equatable {
     var lengthMm: Double
     var ballWidthMm: Double
+    /// Dorsal (instep) height at the midfoot, mm. Proxy for arch height; 0 when unknown
+    /// (e.g. manual entry). Defaulted so older call sites and manual entry still compile.
+    var archHeightMm: Double = 0
 }
 
 struct MeasurementCreateRequest: Codable {

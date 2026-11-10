@@ -41,22 +41,30 @@ async def create_measurement(
     session: AsyncSession = Depends(get_session),
 ) -> MeasurementOut:
     gender = Gender(body.gender)
-    left = compute_foot_sizing(body.left.length_mm, body.left.ball_width_mm, gender)
-    right = compute_foot_sizing(body.right.length_mm, body.right.ball_width_mm, gender)
+    left = compute_foot_sizing(
+        body.left.length_mm, body.left.ball_width_mm, gender, body.left.arch_height_mm
+    )
+    right = compute_foot_sizing(
+        body.right.length_mm, body.right.ball_width_mm, gender, body.right.arch_height_mm
+    )
 
     rec = FootMeasurementRecord(
         device_id=body.device_id,
         gender=body.gender,
         left_length_mm=body.left.length_mm,
         left_width_mm=body.left.ball_width_mm,
+        left_arch_mm=body.left.arch_height_mm,
         left_mondo_mm=left.mondopoint_mm,
         left_us_approx=left.us_size_approx,
         left_width_code=left.width_code.value,
+        left_arch_class=left.arch_class.value,
         right_length_mm=body.right.length_mm,
         right_width_mm=body.right.ball_width_mm,
+        right_arch_mm=body.right.arch_height_mm,
         right_mondo_mm=right.mondopoint_mm,
         right_us_approx=right.us_size_approx,
         right_width_code=right.width_code.value,
+        right_arch_class=right.arch_class.value,
     )
     session.add(rec)
     await session.commit()
@@ -68,9 +76,13 @@ async def create_measurement(
         left_mondo_mm=rec.left_mondo_mm,
         left_us_approx=rec.left_us_approx,
         left_width_code=rec.left_width_code,
+        left_arch_class=rec.left_arch_class,
+        left_sizes=left.sizes,
         right_mondo_mm=rec.right_mondo_mm,
         right_us_approx=rec.right_us_approx,
         right_width_code=rec.right_width_code,
+        right_arch_class=rec.right_arch_class,
+        right_sizes=right.sizes,
     )
 
 
