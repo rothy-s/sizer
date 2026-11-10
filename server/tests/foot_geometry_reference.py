@@ -17,7 +17,8 @@ Pipeline (gravity-aligned input; `up` selects the vertical axis):
   4. PCA in the horizontal plane -> long axis (heel->toe), rotation-invariant.
   5. length  = principal-axis extent (robust percentiles) + TIP_CORRECTION_MM (taper inset).
      width   = max secondary-axis extent within the forefoot region (the "ball").
-     instep  = 95th-percentile dorsal height over the midfoot region.
+     instep  = 95th-percentile dorsal height in a thin slice 62% of the way from heel to
+               toe (the heel end is the one under the ankle, else the taller half).
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ FLOOR_BAND_MM = 10.0        # cut this far above the floor plane (clears noisy f
 LEG_CAP_MM = 95.0           # ignore points taller than this (attached ankle/shin)
 LEG_SHADOW_CAP_MM = 60.0    # height cap inside a leg column (cell with points above LEG_CAP_MM)
 ANKLE_SLICE_MM = 35.0       # leg points this far above LEG_CAP_MM mark where the ankle stands
+INSTEP_AT_FRACTION = 0.62   # instep height is taken this far along the foot from the heel
+INSTEP_HALF_WINDOW = 0.02   # ... over a slice of +/- this fraction of the length
 MAX_FLOOR_SLOPE = 0.12      # ignore a fitted floor steeper than this (m/m): not a floor
 GRID_CELL_M = 0.01          # isolation grid
 TIP_CORRECTION_MM = 26.0    # add back the toe+heel taper lost at the floor-band cut
@@ -66,6 +69,7 @@ class FootStages:
     # from heel points the camera actually saw (the heel sits under the ankle).
     heel_hidden: bool = False
     ankle_cells: set = field(default_factory=set)   # ankle-slice cells joined to the cluster
+    heel_at_tmin: bool | None = None        # which end of the long axis is the heel
     above: list = field(default_factory=list)   # points kept by the floor/leg height band
     band: list = field(default_factory=list)    # the isolated foot cluster
     centroid: tuple | None = None           # (a0, a1) mean of the cluster
@@ -440,9 +444,22 @@ def measure_foot_stages(points, up: int = 1, seed=None,
     # Forefoot region at whichever end reads as the ball (take the larger).
     ball_width_mm = max(width_in(0.45, 0.95), width_in(0.05, 0.55))
 
-    mid_lo = tmin + 0.35 * span
-    mid_hi = tmin + 0.60 * span
-    mid_h = sorted(h for t, _, h in proj if mid_lo <= t <= mid_hi)
+    # Which end is the heel? The one under the ankle; without an ankle, the taller half.
+    mid_t = (tmin + tmax) / 2
+    if virt_ts:
+        heel_at_tmin = sum(virt_ts) / len(virt_ts) < mid_t
+    else:
+        lo_h = [h for t, _, h in proj if t < mid_t]
+        hi_h = [h for t, _, h in proj if t >= mid_t]
+        heel_at_tmin = (sum(lo_h) / len(lo_h) if lo_h else 0.0) >= (sum(hi_h) / len(hi_h) if hi_h else 0.0)
+    st.heel_at_tmin = heel_at_tmin
+
+    # Instep height: dorsal height in a thin slice at INSTEP_AT_FRACTION of the full length
+    # from the heel. Half the tip correction belongs to the heel end of the raw extent.
+    d_lo = ((INSTEP_AT_FRACTION - INSTEP_HALF_WINDOW) * length_mm - tip_correction_mm / 2) / 1000.0
+    d_hi = ((INSTEP_AT_FRACTION + INSTEP_HALF_WINDOW) * length_mm - tip_correction_mm / 2) / 1000.0
+    mid_h = sorted(h for t, _, h in proj
+                   if d_lo <= ((t - tmin) if heel_at_tmin else (tmax - t)) <= d_hi)
     instep_mm = _percentile(mid_h, 0.95) if mid_h else 0.0
     st.length_mm, st.ball_width_mm, st.instep_mm = length_mm, ball_width_mm, instep_mm
 

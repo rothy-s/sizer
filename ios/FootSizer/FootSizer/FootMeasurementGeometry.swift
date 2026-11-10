@@ -19,7 +19,8 @@ import simd
 ///   4. PCA in the horizontal plane → long axis (heel→toe) — rotation invariant.
 ///   5. length = principal-axis extent (robust percentiles) + `tipCorrectionMm` (taper inset);
 ///      ball width = max secondary extent in the forefoot region;
-///      arch/instep = 95th-percentile dorsal height over the midfoot.
+///      arch/instep = 95th-percentile dorsal height in a thin slice 62% of the way from heel
+///      to toe (the heel end is the one under the ankle, else the taller half).
 enum FootMeasurementGeometry {
 
     // Tuned + validated against a parametric foot model (see the Python reference):
@@ -29,6 +30,9 @@ enum FootMeasurementGeometry {
     static let legShadowCapMm: Double = 60.0
     /// Leg points this far above `legCapMm` mark where the ankle stands.
     static let ankleSliceMm: Double = 35.0
+    /// Instep height is taken this far along the foot from the heel, over ± the half window.
+    static let instepAtFraction: Double = 0.62
+    static let instepHalfWindow: Double = 0.02
     static let maxFloorSlope: Double = 0.12
     static let gridCellM: Double = 0.01
     static let tipCorrectionMm: Double = 26.0
@@ -168,9 +172,9 @@ enum FootMeasurementGeometry {
         }
 
         let realTs = proj.map { $0.t }.sorted()
+        let virtTs = virt.map { ($0.0 - ma) * ux + ($0.1 - mb) * uy }
         var allTs = realTs
-        for v in virt {
-            let t = (v.0 - ma) * ux + (v.1 - mb) * uy
+        for t in virtTs {
             for _ in 0..<wvInt { allTs.append(t) }
         }
         let ts = allTs.sorted()
@@ -191,9 +195,28 @@ enum FootMeasurementGeometry {
         }
         let ballWidthMm = max(widthIn(0.45, 0.95), widthIn(0.05, 0.55))
 
-        let midLo = tmin + 0.35 * span
-        let midHi = tmin + 0.60 * span
-        let midH = proj.filter { $0.t >= midLo && $0.t <= midHi }.map { $0.h }.sorted()
+        // Which end is the heel? The one under the ankle; without an ankle, the taller half.
+        let midT = (tmin + tmax) / 2
+        let heelAtTmin: Bool
+        if !virtTs.isEmpty {
+            heelAtTmin = virtTs.reduce(0, +) / Double(virtTs.count) < midT
+        } else {
+            var loSum = 0.0, hiSum = 0.0
+            var loN = 0, hiN = 0
+            for e in proj {
+                if e.t < midT { loSum += e.h; loN += 1 } else { hiSum += e.h; hiN += 1 }
+            }
+            heelAtTmin = (loN > 0 ? loSum / Double(loN) : 0) >= (hiN > 0 ? hiSum / Double(hiN) : 0)
+        }
+
+        // Instep height: dorsal height in a thin slice at `instepAtFraction` of the full length
+        // from the heel. Half the tip correction belongs to the heel end of the raw extent.
+        let dLo = ((instepAtFraction - instepHalfWindow) * lengthMm - tipCorrectionMm / 2) / 1000.0
+        let dHi = ((instepAtFraction + instepHalfWindow) * lengthMm - tipCorrectionMm / 2) / 1000.0
+        let midH = proj.filter {
+            let d = heelAtTmin ? ($0.t - tmin) : (tmax - $0.t)
+            return d >= dLo && d <= dHi
+        }.map { $0.h }.sorted()
         let instepMm = midH.isEmpty ? 0 : percentile(midH, 0.95)
 
         guard lengthMm > 120, lengthMm < 400, ballWidthMm > 40, ballWidthMm < 200 else { return nil }
